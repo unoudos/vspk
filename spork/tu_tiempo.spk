@@ -1,0 +1,186 @@
+#@kt
+# tu_tiempo.spk — Pronóstico del tiempo con vspk 
+#
+
+
+import "vspk"
+
+let XML_URL = "http://xml.tutiempo.net/xml/3589.xml"
+
+# ── Formateo de iconos ───────────────────────────────────────────────────────
+
+fn format_weather_icon(ico) {
+  if ico.starts_with("http") { ico }
+  else {
+    let clean = ico.trim().replace(".svg", "").replace(".png", "")
+    "https://v5i.tutiempo.net/wi/01/50/\(clean).png"
+  }
+}
+
+fn format_moon_icon(ico) {
+  if ico.starts_with("http") { ico }
+  else {
+    let clean = ico.trim().replace(".svg", "").replace(".png", "")
+    "https://v5i.tutiempo.net/wmi/01/\(clean).png"
+  }
+}
+
+# ── Imágenes reactivas (img_dia / img_luna) ───────────────────────────────────
+
+fn Img(id, alt) {
+  "<img id=\"\(id)\" alt=\"\(html_escape(alt))\" src=\"\" style=\"width:48px;height:48px;object-fit:contain;display:block;margin:8px auto;\">"
+}
+
+fn ImgScript() {
+  "<script>
+(function() {
+  function loadImg(id, url) {
+    if (!url) return;
+    var el = document.getElementById(id);
+    if (!el || el.dataset.loaded === url) return;
+    el.dataset.loaded = url;
+    function tryLoad() {
+      if (typeof __vspk !== 'undefined') {
+        el.src = url;
+      } else {
+        setTimeout(tryLoad, 100);
+      }
+    }
+    tryLoad();
+  }
+
+  var _orig = window.__set;
+  window.__set = function(k, v) {
+    if (_orig) _orig(k, v);
+    if (k === 'img_dia')  loadImg('img_dia',  v);
+    if (k === 'img_luna') loadImg('img_luna', v);
+  };
+
+  document.addEventListener('DOMContentLoaded', function() {
+    var check = setInterval(function() {
+      var s = window.__state || {};
+      if (s.img_dia || s.img_luna) {
+        clearInterval(check);
+        loadImg('img_dia',  s.img_dia);
+        loadImg('img_luna', s.img_luna);
+      }
+    }, 100);
+  });
+})();
+</script>"
+}
+
+# ── Carga del XML ────────────────────────────────────────────────────────────
+#
+# xml_tag(texto, tag) devuelve "N/A" (string literal) cuando el tag no
+# aparece — por eso el fallback de fecha_larga chequea contra "N/A", no
+# contra vacío/falsy como hacía el `or "--"` original con bun.XML.parse.
+#
+# OJO — único punto sin verificar contra el XML real: si "nombre" en
+# <localidad> es un ATRIBUTO (<localidad nombre="Málaga">) en vez de un tag
+# hijo (<localidad><nombre>Málaga</nombre></localidad>), esta línea no lo
+# va a encontrar — xml_tag solo busca tags, no atributos. Avisame si hace
+# falta un xml_attr() nuevo para esto; no tengo el XML real para confirmarlo.
+fn load_weather() {
+  try {
+    let text = http_get(XML_URL)
+
+    let dia_section  = xml_section(text, "dia")
+    let hora_section = xml_section(text, "hora")
+    let localidad    = xml_tag(xml_section(text, "localidad"), "nombre")
+
+    if dia_section == "" {
+      { ok: false, localidad: "", dia: nil, temp_actual: "N/A", error: "Sin datos de pronóstico" }
+    } else {
+      let dia = {
+        fecha_larga:   xml_tag(dia_section, "fecha_larga"),
+        temp_maxima:   xml_tag(dia_section, "temp_maxima"),
+        temp_minima:   xml_tag(dia_section, "temp_minima"),
+        humedad:       xml_tag(dia_section, "humedad"),
+        viento:        xml_tag(dia_section, "viento"),
+        dir_viento:    xml_tag(dia_section, "dir_viento"),
+        icono:         xml_tag(dia_section, "icono"),
+        ico_fase_luna: xml_tag(dia_section, "ico_fase_luna")
+      }
+      let temp_actual = if hora_section != "" { xml_tag(hora_section, "temperatura") } else { "N/A" }
+      { ok: true, localidad, dia, temp_actual }
+    }
+  } catch(err) {
+    # En el target Rust nativo, la variable de catch(err) YA es el string
+    # del mensaje de error (no un objeto con campo .message como en JS/Ruby) —
+    # por eso usamos err directamente; err.message daría Nil → se imprimía
+    # literalmente "Error: null".
+    { ok: false, localidad: "", dia: nil, temp_actual: "N/A", error: "\(err)" }
+  }
+}
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+let app = App("Pronóstico del Tiempo - Málaga", 450, 560, "light", "#0284c7")
+
+let ciudad  = app.state("ciudad",  "Cargando clima...")
+let fecha   = app.state("fecha",   "--")
+let temp    = app.state("temp",    "--")
+let maxmin  = app.state("maxmin",  "-- | --")
+let humedad = app.state("humedad", "Humedad: --")
+let viento  = app.state("viento",  "Viento: --")
+let img_dia  = app.state("img_dia",  "")
+let img_luna = app.state("img_luna", "")
+
+fn update_ui(data) {
+  if data.dia == nil { return }
+  let d = data.dia
+
+  ciudad.set(data.localidad)
+  fecha.set(if d.fecha_larga != "N/A" { d.fecha_larga } else { "--" })
+  temp.set("Temperatura actual: \(data.temp_actual) °C")
+
+  maxmin.set("\(d.temp_maxima) °C  |  \(d.temp_minima) °C")
+  humedad.set("Humedad: \(d.humedad)%")
+  viento.set("Viento: \(d.viento) km/h - \(d.dir_viento)")
+  img_dia.set(format_weather_icon(d.icono))
+  img_luna.set(format_moon_icon(d.ico_fase_luna))
+}
+
+fn fetch_weather() {
+  let data = load_weather()
+  if !data.ok {
+    ciudad.set("Error: \(data.error)")
+    return
+  }
+  update_ui(data)
+}
+
+# Carga inicial (antes de arrancar el servidor) — ya no hace falta await,
+# http_get/xml_tag/xml_section son todos síncronos.
+let data0 = load_weather()
+if data0.ok { update_ui(data0) }
+else { ciudad.set("Error: \(data0.error)") }
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+app.add(
+  Col(
+    H1(ciudad),
+    P(fecha),
+    Hr(),
+    Card(
+      H2(temp),
+      P(maxmin),
+      Row(P(humedad), P(viento)),
+    ),
+    Hr(),
+    H3("Indicadores"),
+    Row(
+      Card(P("🌙 Fase Lunar"), Img("img_luna", "Fase Lunar")),
+      Card(P("☀ Día"),         Img("img_dia",  "Icono del Día")),
+    ),
+    ImgScript(),
+    Hr(),
+    Button("Actualizar Pronóstico",
+           app.on_click(fn() { fetch_weather() }),
+           "filled"),
+  )
+)
+
+app.run()

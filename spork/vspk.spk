@@ -1,0 +1,800 @@
+# vspk.spk — GUI nativa para Spork usando vspk como WebView
+#
+
+
+let SPORK_CSS = "spork.css"
+let SPORK_JS  = "spork.js"
+let SPORK_CSS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css"
+let SPORK_JS_CDN  = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js"
+
+# ── Estado global de la app ──────────────────────────────────────────────────
+#
+
+let _states    = {}
+let _widgets   = []
+let _callbacks = {}
+let _events    = {}
+let mut _cb_count = 0
+let mut _port      = 0
+let mut _title     = ""
+let mut _width     = 1024
+let mut _height    = 768
+let mut _theme     = "light"
+let mut _accent    = ""
+let mut _token     = ""
+let mut _key_on    = false
+let mut _close_on  = false
+let mut _running   = false
+let mut _icon_line = ""
+let _timers    = []
+let _cv_ids    = []
+let _wins      = []      # ventanas adicionales (gui.window)
+let mut _win_count = 0
+let _cv_logs   = {}      # id de canvas -> JS de sus dibujos (se reproduce al cargar la página)
+let mut _cv_mouse_js = ""
+
+# ── Buscar ejecutable vspk ───────────────────────────────────────────────────
+
+fn find_vspk() {
+  let exe = if platform() == "win32" { "vspk.exe" } else { "vspk" }
+
+  let from_env = env("VSPK_EXE")
+  if from_env != "" && f_exists_q(from_env) { return from_env }
+
+  let beside_script = path_join(path_dir(import.meta.dir), exe)
+  if f_exists_q(beside_script) { return beside_script }
+
+  let beside_lib = path_join(import.meta.dir, exe)
+  if f_exists_q(beside_lib) { return beside_lib }
+
+  let in_path = which(exe)
+  if in_path != "" { return in_path }
+
+  exe   # fallback — el SO reportará el error
+}
+
+# ── Helpers HTML ─────────────────────────────────────────────────────────────
+
+fn html_escape(s) {
+  s
+    .replace("&",  "&amp;")
+    .replace("<",  "&lt;")
+    .replace(">",  "&gt;")
+    .replace("\"", "&quot;")
+}
+
+fn tag(t, css_class, attrs, *kids) {
+  let cls_attr   = if css_class != ""   { " class=\"\(css_class)\""  } else { "" }
+  let attrs_str  = attrs
+    .entries()
+    .map(fn(kv) {
+      let k = kv[0]
+      let v = kv[1]
+      if k == "onclick" || k == "oninput" || k == "onchange" {
+        " \(k)=\"\(v.replace("\"", "&quot;"))\""
+      } else {
+        " \(k)=\"\(html_escape(v))\""
+      }
+    })
+    .join("")
+  let inner = kids.map(fn(c) {
+    # type_of() de un objeto state()/widget devuelve "hash" en el target Rust
+    # nativo, pero "object" en el target bun/JS (ahí los hashes de Spork son
+    # objetos planos de JS — typeof {} === 'object', no hay un tipo "hash"
+    # nativo separado). Chequear solo "hash" hacía que en bun esta rama NUNCA
+    # entrara — cada H1(ciudad)/P(fecha)/etc. caía al else y terminaba
+    # interpolando el Hash entero (vía JSON.stringify, ver sporkInterpWrap en
+    # el emitter) en vez de llamar a su to_html() — eso es lo que se veía en
+    # pantalla como "{"name":{}}" en vez del texto real. Se acepta cualquiera
+    # de los dos strings para que la misma condición funcione en ambos
+    # targets sin tener que tocar el emitter.
+    if (type_of(c) == "hash" || type_of(c) == "object") && c.to_html { c.to_html() }
+    else { "\(c)" }
+  }).join("\n")
+  let void  = t == "input" || t == "hr" || t == "br"
+  if void       { "<\(t)\(cls_attr)\(attrs_str)>" }
+  else if inner == "" { "<\(t)\(cls_attr)\(attrs_str)></\(t)>" }
+  else          { "<\(t)\(cls_attr)\(attrs_str)>\n\(inner)\n</\(t)>" }
+}
+
+# ── Widgets ──────────────────────────────────────────────────────────────────
+
+fn Row(*kids)    { tag("div",  "sz-row",           {},  ...kids) }
+fn Col(*kids)    { tag("div",  "sz-col sz-center",  {},  ...kids) }
+fn Card(*kids)   { tag("div",  "sz-card",           {},  ...kids) }
+fn Grid(*kids)   { tag("div",  "sz-grid",           {},  ...kids) }
+fn Hr()          { "<hr class=\"sz-divider\">" }
+fn Spacer()      { "<div class=\"sz-grow\"></div>" }
+
+fn H1(c)          { tag("h1",    "sz-h1",    {}, c) }
+fn H2(c)          { tag("h2",    "sz-h2",    {}, c) }
+fn H3(c)          { tag("h3",    "sz-h3",    {}, c) }
+fn H4(c)          { tag("h4",    "sz-h4",    {}, c) }
+fn P(c)           { tag("p",     "sz-p",     {}, c) }
+fn Label(c)       { tag("label", "sz-label", {}, c) }
+fn Badge(c)       { tag("span",  "sz-badge", {}, c) }
+
+fn Chip(text, primary = false) {
+  let css_class = if primary { "sz-chip sz-chip-primary" } else { "sz-chip" }
+  tag("span", css_class, {}, text)
+}
+
+fn Alert(c, variant = "") {
+  let css_class = if variant != "" { "sz-alert sz-alert-\(variant)" } else { "sz-alert" }
+  tag("div", css_class, {}, c)
+}
+
+fn Button(text, js = "", variant = "filled", size = "") {
+  let css_class   = "sz-btn sz-btn-\(variant)\(if size != "" { " sz-btn-\(size)" } else { "" })"
+  let attrs = if js != "" { {"data-ripple": "", "onclick": js} } else { {"data-ripple": ""} }
+  tag("button", css_class, attrs, text)
+}
+
+fn Input(placeholder = "", bind = nil) {
+  let attrs = {"type": "text"}
+  if placeholder != "" { attrs["placeholder"] = placeholder }
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["oninput"]         = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  tag("input", "sz-input", attrs)
+}
+
+fn Textarea(placeholder = "", rows = 4, bind = nil) {
+  let attrs = {"rows": "\(rows)"}
+  if placeholder != "" { attrs["placeholder"] = placeholder }
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["oninput"]         = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  tag("textarea", "sz-textarea", attrs)
+}
+
+fn Checkbox(label_text, bind = nil) {
+  let attrs = {"type": "checkbox"}
+  if bind != nil {
+    attrs["data-spork-checked"] = bind.name
+    attrs["onchange"] = "window.__set('\(bind.name)',this.checked);window.__sync('\(bind.name)',this.checked)"
+  }
+  let chk   = tag("input", "", attrs)
+  let track = "<span class=\"sz-switch-track\"><span class=\"sz-switch-thumb\"></span></span>"
+  let lbl   = "<span class=\"sz-switch-label\">\(label_text)</span>"
+  tag("label", "sz-switch", {}, chk, track, lbl)
+}
+
+fn Select(options, bind = nil) {
+  let opts = options.map(fn(pair) {
+    let val = pair[0]
+    let lbl = pair[1]
+    "<option value=\"\(html_escape(val))\">\(html_escape(lbl))</option>"
+  }).join("\n")
+  let attrs = {}
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["onchange"] = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  "<select class=\"sz-select\"\(attrs.entries().map(fn(kv) { " \(kv[0])=\"\(kv[1])\"" }).join(""))>\n\(opts)\n</select>"
+}
+
+fn Progress(state) {
+  let style_expr = html_escape("{\"width\": window.__state.\(state.name) + \"%\"}")
+  "<div class=\"sz-progress\"><div class=\"sz-progress-bar\" data-spork-style=\"\(style_expr)\"></div></div>"
+}
+
+fn Avatar(src, alt = "") {
+  "<img class=\"sz-avatar\" src=\"\(html_escape(src))\" alt=\"\(html_escape(alt))\">"
+}
+
+fn Divider() { "<hr class=\"sz-divider\">" }
+
+fn _push_sse(event, data) {
+  vspk_bridge_push_sse("event: \(event)\ndata: \(to_json(data))\n\n")
+}
+
+fn _push_state(name, value) {
+  _states[name] = value
+  _push_sse("state", {"name": name, "value": value})
+}
+
+# ── State reactivo ──────────────────────────────────────────────────────────
+
+fn state(name, initial) {
+  _states[name] = initial
+
+  fn to_html() { "<span data-spork-text=\"\(name)\"></span>" }
+
+  fn js_get()       { "window.__state.\(name)" }
+  fn js_set(val)    { "window.__set('\(name)',\(to_json(val)))" }
+  fn js_inc(by = 1) { "window.__set('\(name)',window.__state.\(name)+\(by))" }
+  fn js_dec(by = 1) { "window.__set('\(name)',window.__state.\(name)-\(by))" }
+
+  fn get()       { _states[name] }
+  fn set(val)    { _push_state(name, val) }
+  fn inc(by = 1) { set(get() + by) }
+  fn dec(by = 1) { set(get() - by) }
+
+  { name, to_html, js_get, js_set, js_inc, js_dec, get, set, inc, dec,
+    __str__: fn() { to_html() } }
+}
+
+# ── Callbacks JS → Spork ────────────────────────────────────────────────────
+
+fn on_click(fn_cb) {
+  _cb_count = _cb_count + 1
+  let id = "cb_\(_token)_\(_cb_count)"
+  _callbacks[id] = fn_cb
+  "fetch('http://127.0.0.1:\(_port)/cb/\(id)',{mode:'no-cors'})"
+}
+
+fn on_event(name, fn_cb) {
+  _events[name] = fn_cb
+}
+
+# Nombre de evento interno: lleva el token de esta ejecución, así otra página no puede adivinarlo.
+fn _ev(name) { "__\(name)_\(_token)" }
+
+# JS que avisa a Spork de un evento (cuerpo = expresión JS ya serializable con JSON.stringify).
+fn _post_js(name, body_expr) {
+  "fetch('http://127.0.0.1:\(_port)/event/\(name)',{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:\(body_expr)})"
+}
+
+# Teclado: fn(e) con e["key"], e["code"], e["ctrl"], e["shift"], e["alt"], e["meta"].
+fn on_key(fn_cb) {
+  _key_on = true
+  on_event(_ev("k"), fn_cb)
+}
+
+# Cierre de ventana: se llama a fn_cb() y la ventana se cierra, salvo que devuelva false.
+# Llama a f(); si falla devuelve true (así un error en el manejador no deja la ventana sin poder cerrarse).
+fn _safe_true(f) { try { _call0(f) } else { true } }
+
+# Llamar a un callback recibido por parámetro: pasa por un hash para que cada target
+# (sobre todo Kotlin, con parámetros Any?) lo invoque de forma dinámica.
+fn _call0(f) {
+  let h = { "f": f }
+  h["f"]()
+}
+
+fn _call1(f, a) {
+  let h = { "f": f }
+  h["f"](a)
+}
+
+fn on_close(fn_cb) {
+  _close_on = true
+  on_event(_ev("c"), fn(d) {
+    let r = _safe_true(fn_cb)
+    if r == false { eval_js("__vspk.cancelClose()") }
+    if r != false { eval_js("__vspk.confirmClose()") }
+  })
+}
+
+fn _dialog(kind, title, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("d\(_cb_count)")
+  on_event(name, fn(d) { _call1(fn_cb, d["path"]) })
+  eval_js("__vspk.dialog({kind:'\(kind)',title:\(to_json(title))}).then(function(p){\(_post_js(name, "JSON.stringify({path:p})"))})")
+}
+
+# Diálogos nativos: fn_cb(ruta) — ruta es nil si el usuario cancela.
+fn pick_file(title, fn_cb)   { _dialog("open", title, fn_cb) }
+fn save_file(title, fn_cb)   { _dialog("save", title, fn_cb) }
+fn pick_folder(title, fn_cb) { _dialog("folder", title, fn_cb) }
+
+# ── Diálogos modales (mensaje / confirmación / pedir texto) ──────────────────
+
+fn _modal(call, kind, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("m\(_cb_count)")
+  on_event(name, fn(d) {
+    if fn_cb != nil {
+      if kind == "message" { _call0(fn_cb) }
+      if kind == "confirm" { _call1(fn_cb, d["v"] == true) }
+      if kind == "prompt"  { _call1(fn_cb, d["v"]) }
+    }
+  })
+  eval_js("Promise.resolve(\(call)).then(function(v){\(_post_js(name, "JSON.stringify({v:v})"))})")
+}
+
+# message("texto", fn() { ... })   — un botón Aceptar; fn_cb() al cerrarlo (pasa nil si no necesitas nada)
+fn message(text, fn_cb)  { _modal("alert(\(to_json(text)))", "message", fn_cb) }
+# confirm("¿Seguro?", fn(ok) { ... })  — Aceptar/Cancelar; ok es true/false
+fn confirm(text, fn_cb)        { _modal("confirm(\(to_json(text)))", "confirm", fn_cb) }
+# prompt("Nombre", fn(texto) { ... }, "valor inicial")  — texto es nil si se cancela
+fn prompt(text, fn_cb, default_value) { _modal("prompt(\(to_json(text)),\(to_json(default_value)))", "prompt", fn_cb) }
+
+# ── Tabla, árbol, lista (se hidratan en la página; ver vspk_ui.js incrustado en vspk.exe) ──
+#
+#   Table(["Nombre", "Edad"], [["Ana", 31], ["Luis", 28]], fn(d) { print(d["row"]) }, nil, nil, true, false, true, "", "tabla")
+#     on_select(d) → d["index"], d["row"], d["indexes"], d["rows"]    (index = posición original en rows)
+#     clic en la cabecera ordena; sortable=false lo desactiva; multi=true permite Ctrl/Shift
+#     columnas: "texto" o {"label": "Edad", "align": "right", "width": 80}
+#     para cambiar datos después hace falta un id:  gui.eval_js(table_set_js("tabla", filas))
+#
+let mut _vt_count = 0
+
+fn _vt_ev(fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("v\(_cb_count)")
+  on_event(name, fn(d) { _call1(fn_cb, d) })
+  _post_js(name, "JSON.stringify(p)")
+}
+
+fn _vt_attrs(el_id, cfg, on_select, on_dblclick, on_sort, style = "") {
+  let attrs = {"id": el_id, "data-vt": to_json(cfg)}
+  if style != "" { attrs["style"] = style }
+  if on_select   != nil { attrs["data-on-select"]   = _vt_ev(on_select) }
+  if on_dblclick != nil { attrs["data-on-dblclick"] = _vt_ev(on_dblclick) }
+  if on_sort     != nil { attrs["data-on-sort"]     = _vt_ev(on_sort) }
+  attrs
+}
+
+fn _vt_id(prefix, el_id) {
+  if el_id != "" { return el_id }
+  _vt_count = _vt_count + 1
+  "\(prefix)\(_vt_count)"
+}
+
+fn Table(cols, rows, on_select = nil, on_dblclick = nil, on_sort = nil, sortable = true, multi = false, header = true, height = "", id = "") {
+  let el_id = _vt_id("vt", id)
+  let cfg = {"cols": cols, "rows": rows, "sortable": sortable, "multi": multi, "striped": true, "header": header, "selected": -1}
+  if height != "" { cfg["height"] = height }
+  tag("div", "vspk-table", _vt_attrs(el_id, cfg, on_select, on_dblclick, on_sort))
+}
+
+# Lista de una columna sin cabecera. on_select(d) → d["row"][0] es el elemento.
+fn Listbox(items, on_select = nil, on_dblclick = nil, height = "", id = "") {
+  let rows = items.map(fn(x) { [x] })
+  let el_id = _vt_id("vt", id)
+  let cfg = {"cols": [""], "rows": rows, "sortable": false, "multi": false, "striped": false, "header": false, "selected": -1}
+  if height != "" { cfg["height"] = height }
+  tag("div", "vspk-table", _vt_attrs(el_id, cfg, on_select, on_dblclick, nil))
+}
+
+# Tree([{"label": "src", "open": true, "children": [{"label": "main.rs", "id": 7}]}], fn(d) { ... })
+#   on_select(d) → d["path"], d["label"], d["id"]
+fn Tree(nodes, on_select = nil, on_dblclick = nil, height = "", id = "") {
+  let el_id = _vt_id("vtree", id)
+  let st = if height != "" { "max-height:\(height)" } else { "" }
+  tag("div", "vspk-tree", _vt_attrs(el_id, {"nodes": nodes}, on_select, on_dblclick, nil, st))
+}
+
+# JS para cambiar datos: gui.eval_js(table_set_js("tabla", filas))  /  ventana.eval_js(...)
+fn table_set_js(el_id, rows, cols = nil) {
+  let c = if cols == nil { "null" } else { to_json(cols) }
+  "window.__vspk_table_set(\(to_json(el_id)),\(c),\(to_json(rows)))"
+}
+fn table_select_js(el_id, index)    { "window.__vspk_table_select(\(to_json(el_id)),\(index))" }
+fn table_sort_js(el_id, col, dir = 1) { "window.__vspk_table_sort(\(to_json(el_id)),\(col),\(dir))" }
+fn tree_set_js(el_id, nodes)        { "window.__vspk_tree_set(\(to_json(el_id)),\(to_json(nodes)))" }
+
+fn table_set(el_id, rows)             { eval_js(table_set_js(el_id, rows, nil)) }
+fn table_set_cols(el_id, rows, cols)  { eval_js(table_set_js(el_id, rows, cols)) }
+fn table_select(el_id, index)         { eval_js(table_select_js(el_id, index)) }
+fn table_sort(el_id, col, dir)         { eval_js(table_sort_js(el_id, col, dir)) }   # dir: 1 asc, -1 desc
+fn tree_set(el_id, nodes)             { eval_js(tree_set_js(el_id, nodes)) }
+
+# Selector de color / fecha enlazados a un estado.
+fn ColorPicker(bind) {
+  tag("input", "sz-input", {"type": "color", "data-spork-bind": bind.name,
+    "oninput": "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"})
+}
+fn DatePicker(bind, with_time = false) {
+  let t = if with_time { "datetime-local" } else { "date" }
+  tag("input", "sz-input", {"type": t, "data-spork-bind": bind.name,
+    "oninput": "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"})
+}
+
+fn _timer(js_fn, ms, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("t\(_cb_count)")
+  on_event(name, fn(d) { _call0(fn_cb) })
+  let js = "\(js_fn)(function(){\(_post_js(name, "'{}'"))},\(ms))"
+  _timers.push("\(js)")
+  if _running { eval_js(js) }
+  true
+}
+
+fn run_every(ms, fn_cb) { _timer("setInterval", ms, fn_cb) }
+fn run_after(ms, fn_cb) { _timer("setTimeout", ms, fn_cb) }
+
+fn set_title(t)              { eval_js("__vspk.setTitle(\(to_json(t)))") }
+fn notify(title, body = "")  { eval_js("__vspk.notify(\(to_json(title)),\(to_json(body)))") }
+fn copy_text(text)           { eval_js("__vspk.clipboard.write(\(to_json(text)))") }
+fn quit()                    { eval_js("__vspk.close()") }
+
+# ── Canvas ───────────────────────────────────────────────────────────────────
+#
+#   let cv = gui.canvas("lienzo", 400, 300)
+#   cv.color("#6750A4")          # color de relleno y trazo
+#   cv.rect(10, 10, 100, 60)     # rectángulo relleno      (frame = solo borde)
+#   cv.circle(200, 60, 40)       # círculo relleno         (ring  = solo borde)
+#   cv.line(0, 0, 400, 300)      # línea (ver line_width)
+#   cv.text(10, 280, "hola")     # texto (ver font)
+#   cv.erase()                   # borra todo
+#   cv.on_mouse(fn(e) { ... })   # e["type"] = down|up|move|click, e["x"], e["y"], e["button"]
+
+fn _cv_do(id, op, args) {
+  let js = "__cv(\(to_json(id)),\(to_json(op)),\(to_json(args)))"
+  if op == "clear" { _cv_logs[id] = "" }
+  _cv_logs[id] = "\(_cv_logs[id])\(js);"
+  if _running { _push_sse("all", js) }
+  true
+}
+
+fn _cv_on_mouse(id, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("m\(_cb_count)")
+  on_event(name, fn_cb)
+  let js = "(function(){var c=document.getElementById('\(id)');if(!c)return;function p(t,e){if(t==='move'){var n=Date.now();if(n-(c.__lm||0)<30)return;c.__lm=n;}var r=c.getBoundingClientRect();\(_post_js(name, "JSON.stringify({type:t,x:Math.round((e.clientX-r.left)*c.width/r.width),y:Math.round((e.clientY-r.top)*c.height/r.height),button:e.button})"))}['down','up','move','click'].forEach(function(t){c.addEventListener(t==='down'?'mousedown':t==='up'?'mouseup':t==='move'?'mousemove':'click',function(e){p(t,e)})})})();"
+  _cv_mouse_js = _cv_mouse_js + js
+  if _running { _push_sse("all", js) }
+  true
+}
+
+fn canvas(id, w, h) {
+  _cv_logs[id] = ""
+  _cv_ids.push(id)
+
+  fn to_html() {
+    "<canvas id=\"\(id)\" width=\"\(w)\" height=\"\(h)\" style=\"width:\(w)px;max-width:100%;height:auto;border:1px solid rgba(128,128,128,.4);border-radius:8px;touch-action:none\"></canvas>"
+  }
+
+  fn _color(c)         { _cv_do(id, "color", [c]) }
+  fn _line_width(n)    { _cv_do(id, "lw", [n]) }
+  fn _font(size)       { _cv_do(id, "font", [size]) }
+  fn _line(x1, y1, x2, y2) { _cv_do(id, "line", [x1, y1, x2, y2]) }
+  fn _rect(x, y, rw, rh)   { _cv_do(id, "rect", [x, y, rw, rh]) }
+  fn _frame(x, y, rw, rh)  { _cv_do(id, "frame", [x, y, rw, rh]) }
+  fn _circle(x, y, r)      { _cv_do(id, "circle", [x, y, r]) }
+  fn _ring(x, y, r)        { _cv_do(id, "ring", [x, y, r]) }
+  fn _text(x, y, s)        { _cv_do(id, "text", [x, y, s]) }
+  fn _poly(points)         { _cv_do(id, "poly", [points]) }
+  fn _clear()              { _cv_do(id, "clear", []) }
+  fn _draw(js)             { _cv_do(id, "draw", [js]) }
+
+  fn _on_mouse(fn_cb) { _cv_on_mouse(id, fn_cb) }
+
+  { to_html, color: _color, line_width: _line_width, font: _font, line: _line, rect: _rect,
+    frame: _frame, circle: _circle, ring: _ring, text: _text, poly: _poly, erase: _clear,
+    draw: _draw, on_mouse: _on_mouse, __str__: fn() { to_html() } }
+}
+
+# ── Ventanas adicionales ─────────────────────────────────────────────────────
+#
+#   let aj = gui.window("Ajustes", 360, 240)
+#   aj.add(Col(H4("Ajustes"), Input("Nombre", nombre)))    # los states se comparten entre ventanas
+#   aj.show()     # abre (si ya está abierta no hace nada)      aj.close()
+#   aj.on_close(fn() { true })   # devuelve false para cancelar el cierre
+#   aj.set_title("..."), aj.eval_js("...")
+
+fn _win_open(info) {
+  let p = info["proc"]
+  if p != false {
+    if !p.exited() { return true }
+  }
+  let page = _page_html(info["title"], info["widgets"].join("\n"), "eval_\(info["id"])", false, info["close_js"])
+  let close_line = if info["close_on"] { "on_close: confirm\n" } else { "" }
+  let htv_path = temp_file("vspk_", ".htv")
+  f_write(htv_path, "title: \(info["title"])\nwidth: \(info["w"])\nheight: \(info["h"])\ndevtools: true\n\(_icon_line)\(close_line)\n\(page)")
+  info["htv"] = htv_path
+  info["proc"] = spawn([find_vspk(), htv_path])
+  true
+}
+
+fn _win_eval(info, js) {
+  _push_sse("eval_\(info["id"])", js)
+}
+
+fn _win_show(info) {
+  if _running { _win_open(info) }
+  if !_running { info["want"] = true }
+  true
+}
+
+fn _win_on_close(info, fn_cb) {
+  let ev = _ev("c\(info["id"])")
+  info["close_on"] = true
+  info["close_js"] = "window.addEventListener('vspk:closeRequested',function(){\(_post_js(ev, "'{}'"))});"
+  on_event(ev, fn(d) {
+    let r = _safe_true(fn_cb)
+    if r == false { _win_eval(info, "__vspk.cancelClose()") }
+    if r != false { _win_eval(info, "__vspk.confirmClose()") }
+  })
+  true
+}
+
+fn _win_add(info, w1, w2, w3, w4) {
+  for w in [w1, w2, w3, w4] {
+    if w != "" { info["widgets"].push("\(w)") }
+  }
+  true
+}
+
+fn window(title, width = 480, height = 360) {
+  _win_count = _win_count + 1
+  let info = { "id": "w\(_win_count)", "title": title, "w": width, "h": height, "widgets": [],
+               "proc": false, "htv": "", "want": false, "close_on": false, "close_js": "" }
+  _wins.push(info)
+
+  fn _add(a = "", b = "", c = "", d = "") { _win_add(info, a, b, c, d) }
+  fn _show()                  { _win_show(info) }
+  fn _close()                 { _win_eval(info, "__vspk.close()") }
+  fn _set_title(t)            { _win_eval(info, "__vspk.setTitle(\(to_json(t)))") }
+  fn _eval_js(js)             { _win_eval(info, js) }
+  fn _on_close(fn_cb)         { _win_on_close(info, fn_cb) }
+  fn _is_open()               { _win_is_open(info) }
+
+  { add: _add, show: _show, close: _close, set_title: _set_title, eval_js: _eval_js,
+    on_close: _on_close, is_open: _is_open }
+}
+
+fn _win_is_open(info) {
+  let p = info["proc"]
+  if p == false { return false }
+  !p.exited()
+}
+
+# ── Menús (barra de menú HTML con atajos de teclado) ─────────────────────────
+#
+#   gui.add(MenuBar(
+#     Menu("Archivo", MenuItem("Abrir...", gui.on_click(fn() { ... }), "ctrl+o"), MenuSep(), MenuItem("Salir", gui.on_click(fn() { gui.quit() }))),
+#     Menu("Ayuda", MenuItem("Acerca de", gui.on_click(fn() { ... })))
+#   ), resto...)
+#
+#   Atajos: "ctrl+o", "ctrl+shift+s", "alt+x", "f5"... (orden: ctrl, shift, alt, tecla).
+
+fn MenuItem(label, js = "", shortcut = "") {
+  let click = js.replace("\"", "&quot;")
+  let kbd = if shortcut != "" { "<kbd>\(html_escape(shortcut))</kbd>" } else { "" }
+  "<button type=\"button\" class=\"sz-menu-item\" onclick=\"\(click)\" data-accel=\"\(html_escape(shortcut))\"><span>\(html_escape(label))</span>\(kbd)</button>"
+}
+
+fn MenuSep() { "<div class=\"sz-menu-sep\"></div>" }
+
+fn Menu(title, *items) {
+  "<div class=\"sz-menu\"><button type=\"button\" class=\"sz-menu-title\">\(html_escape(title))</button><div class=\"sz-menu-list\">\(items.join(""))</div></div>"
+}
+
+fn MenuBar(*menus) {
+  "<style>.sz-menubar{position:fixed;top:0;left:0;right:0;z-index:1000;display:flex;gap:2px;padding:3px 6px;background:var(--sz-surface,#fff);color:var(--sz-on-surface,#1d1b20);border-bottom:1px solid rgba(128,128,128,.3);font-size:14px}.sz-menubar-space{height:38px;width:100%;flex:none}.sz-menu{position:relative}.sz-menu-title{background:none;border:0;padding:6px 10px;border-radius:6px;color:inherit;font:inherit;cursor:pointer}.sz-menu-title:hover,.sz-menu.sz-open>.sz-menu-title{background:rgba(128,128,128,.18)}.sz-menu-list{display:none;position:absolute;top:100%;left:0;min-width:210px;padding:4px;background:var(--sz-surface,#fff);color:inherit;border:1px solid rgba(128,128,128,.35);border-radius:8px;box-shadow:0 6px 20px rgba(0,0,0,.2)}.sz-menu.sz-open>.sz-menu-list{display:block}.sz-menu-item{display:flex;justify-content:space-between;gap:24px;width:100%;background:none;border:0;padding:6px 10px;border-radius:6px;color:inherit;font:inherit;cursor:pointer;text-align:left}.sz-menu-item:hover{background:rgba(128,128,128,.18)}.sz-menu-item kbd{opacity:.6;font:inherit;font-size:12px}.sz-menu-sep{height:1px;margin:4px 6px;background:rgba(128,128,128,.3)}.sz-native .sz-menubar,.sz-native .sz-menubar-space{display:none!important}</style><div class=\"sz-menubar\">\(menus.join(""))</div><div class=\"sz-menubar-space\"></div><script>(function(){if(window.__menu)return;window.__menu=1;var bar=document.querySelector('.sz-menubar');function menus(){return bar.querySelectorAll(':scope > .sz-menu')}window.__vspk_menu_click=function(id){var p=id.split('.');var m=menus()[+p[0]];if(m)m.querySelector('.sz-menu-list').children[+p[1]].click()};window.__vspk_menu_ok=function(){document.documentElement.classList.add('sz-native')};if(bar&&window.ipc&&window.__vspk_native_menu_ok){var ms=[];Array.prototype.forEach.call(menus(),function(m,mi){var items=[];Array.prototype.forEach.call(m.querySelector('.sz-menu-list').children,function(c,ii){if(c.classList.contains('sz-menu-sep'))items.push({sep:true});else items.push({id:mi+'.'+ii,label:(c.querySelector('span')||c).textContent,accel:c.getAttribute('data-accel')||''})});ms.push({label:m.querySelector('.sz-menu-title').textContent,items:items})});window.ipc.postMessage(JSON.stringify({cmd:'setMenu',menu:ms}))}function closeAll(except){document.querySelectorAll('.sz-menu.sz-open').forEach(function(m){if(m!==except)m.classList.remove('sz-open')})}document.addEventListener('click',function(e){var t=e.target.closest?e.target.closest('.sz-menu-title'):null;closeAll(t?t.parentNode:null);if(t)t.parentNode.classList.toggle('sz-open');var it=e.target.closest?e.target.closest('.sz-menu-item'):null;if(it)closeAll(null)});document.addEventListener('mouseover',function(e){var t=e.target.closest?e.target.closest('.sz-menu-title'):null;var o=document.querySelector('.sz-menu.sz-open');if(t&&o&&o!==t.parentNode){closeAll(t.parentNode);t.parentNode.classList.add('sz-open')}});document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeAll(null);return}if(document.documentElement.classList.contains('sz-native')&&!/Win/.test(navigator.platform))return;var k=(e.ctrlKey?'ctrl+':'')+(e.shiftKey?'shift+':'')+(e.altKey?'alt+':'')+e.key.toLowerCase();var items=document.querySelectorAll('.sz-menu-item[data-accel]');for(var i=0;i<items.length;i++){var a=items[i].getAttribute('data-accel');if(a&&a.toLowerCase()===k){e.preventDefault();items[i].click();return}}})})();</script>"
+}
+
+fn add(*ws) {
+  for w in ws { _widgets.push("\(w)") }
+}
+
+fn eval_js(js) {
+  _push_sse("eval", js)
+}
+
+# ── Construir HTML completo ─────────────────────────────────────────────────
+
+fn _build_html() {
+  _page_html(_title, _widgets.join("\n"), "eval", true, "")
+}
+
+# Página de una ventana: la principal (eval_ev = "eval") o una hija (eval_ev = "eval_<id>").
+fn _page_html(title, body_html, eval_ev, is_main, child_close_js) {
+  let state_json = to_json(_states)
+  let key_js = if _key_on && is_main {
+    "document.addEventListener('keydown',function(e){\(_post_js(_ev("k"), "JSON.stringify({key:e.key,code:e.code,ctrl:e.ctrlKey,shift:e.shiftKey,alt:e.altKey,meta:e.metaKey})"))});"
+  } else { "" }
+  let main_close_js = if _close_on && is_main {
+    "window.addEventListener('vspk:closeRequested',function(){\(_post_js(_ev("c"), "'{}'"))});"
+  } else { "" }
+  let close_js = main_close_js + child_close_js
+  let timers_js = if is_main { _timers.join(";") + ";" } else { "" }
+  let cv_js = "\(_cv_ids.map(fn(i) { _cv_logs[i] }).join(""))\(_cv_mouse_js)"
+  let accent_style = if _accent != "" {
+    "<style>:root{--sz-accent:\(_accent);} .sz-btn-filled{background:\(_accent);border-color:\(_accent);}</style>"
+  } else { "" }
+
+  "<!DOCTYPE html>
+<html data-theme=\"\(_theme)\">
+<head>
+  <meta charset=\"UTF-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>\(html_escape(title))</title>
+  <link rel=\"icon\" href=\"data:,\">
+  <link rel=\"stylesheet\" href=\"\(SPORK_CSS)\" onerror=\"this.onerror=null;this.href='\(SPORK_CSS_CDN)'\">
+  \(accent_style)
+</head>
+<body class=\"sz-body\">
+
+<div id=\"__app\" class=\"sz-page\">
+\(body_html)
+</div>
+
+<script>
+window.__state = \(state_json);
+window.__win = '\(eval_ev)';
+
+window.__set = function(name, value) {
+  window.__state[name] = value;
+  document.querySelectorAll('[data-spork-text=\"' + name + '\"]').forEach(function(el) {
+    el.textContent = value;
+  });
+  document.querySelectorAll('[data-spork-bind=\"' + name + '\"]').forEach(function(el) {
+    if (el.type === 'checkbox') el.checked = value;
+    else el.value = value;
+  });
+  document.querySelectorAll('[data-spork-style]').forEach(function(el) {
+    try { Object.assign(el.style, new Function('return (' + el.dataset.sporkStyle + ')')()) } catch(_){}
+  });
+  document.querySelectorAll('[data-spork-if]').forEach(function(el) {
+    try { el.style.display = new Function('return !!(' + el.dataset.sporkIf + ')')() ? '' : 'none' } catch(_){}
+  });
+  document.querySelectorAll('[data-spork-checked=\"' + name + '\"]').forEach(function(el) {
+    el.checked = !!value;
+  });
+};
+
+// Envía a Spork el valor que el usuario escribe/elige, para que state.get() lo vea
+// (los widgets enlazados solo actualizaban la página). POST simple (text/plain, no-cors).
+window.__sync = function(n, v) {
+  try {
+    fetch('http://127.0.0.1:\(_port)/event/\(_ev("v"))', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})});
+  } catch(_) {}
+};
+
+window.__cv = function(id, op, a) {
+  var c = document.getElementById(id); if (!c) return;
+  var x = c.getContext('2d');
+  if (op === 'clear') { x.clearRect(0, 0, c.width, c.height); }
+  else if (op === 'color') { x.fillStyle = a[0]; x.strokeStyle = a[0]; }
+  else if (op === 'lw') { x.lineWidth = a[0]; }
+  else if (op === 'font') { x.font = a[0] + 'px sans-serif'; }
+  else if (op === 'line') { x.beginPath(); x.moveTo(a[0], a[1]); x.lineTo(a[2], a[3]); x.stroke(); }
+  else if (op === 'rect') { x.fillRect(a[0], a[1], a[2], a[3]); }
+  else if (op === 'frame') { x.strokeRect(a[0], a[1], a[2], a[3]); }
+  else if (op === 'circle') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.fill(); }
+  else if (op === 'ring') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.stroke(); }
+  else if (op === 'text') { x.fillText(a[2], a[0], a[1]); }
+  else if (op === 'poly') { var p = a[0]; x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (var i = 1; i < p.length; i++) x.lineTo(p[i][0], p[i][1]); x.closePath(); x.fill(); }
+  else if (op === 'draw') { new Function('ctx', 'canvas', a[0])(x, c); }
+};
+Object.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });
+\(key_js)
+\(close_js)
+\(timers_js)
+\(cv_js)
+
+(function connectSSE() {
+  var es = new EventSource('http://127.0.0.1:\(_port)/events');
+  es.addEventListener('state', function(e) {
+    var d = JSON.parse(e.data);
+    if (d.src && d.src === window.__win) return;
+    window.__set(d.name, d.value);
+  });
+  ['\(eval_ev)', 'all'].forEach(function(n) {
+    es.addEventListener(n, function(e) {
+      try { eval(JSON.parse(e.data)); } catch(err) { console.error(err); }
+    });
+  });
+  es.onerror = function() {
+    es.close();
+    setTimeout(connectSSE, 1000);
+  };
+})();
+</script>
+<script src=\"\(SPORK_JS)\" onerror=\"var s=document.createElement('script');s.src='\(SPORK_JS_CDN)';document.body.appendChild(s)\"></script>
+</body>
+</html>"
+}
+
+# ── App — arma estado y UI, pero NO arranca nada todavía ────────────────────
+
+fn App(title, width = 1024, height = 768, theme = "light", accent = "") {
+  _title  = title
+  _width  = width
+  _height = height
+  _theme  = theme
+  _accent = accent
+  _port   = floor(rand() * 10000) + 20000
+  _token  = str(int(rand() * 1000000000)) + str(int(rand() * 1000000000)) + str(int(rand() * 1000000000))
+
+  { state, canvas, window, add, on_click, on_event, eval_js, run,
+    on_key, on_close, pick_file, save_file, pick_folder, run_every, run_after,
+    set_title, notify, copy_text, quit,
+    message, confirm, prompt, table_set, table_set_cols, table_select, table_sort, tree_set }
+}
+
+# ── run() — arranca el puente HTTP/SSE, abre la ventana, atiende eventos ────
+
+fn run() {
+  let _vspk_exe = find_vspk()
+
+  # Arranca el servidor HTTP/SSE en su propio thread — no bloquea, vuelve
+  # enseguida (ver prelude.rs: vspk_bridge_start).
+  vspk_bridge_start(_port)
+
+  let html = _build_html()
+
+  # Icono de la ventana: solo si hay icon.ico/png o favicon.ico/png en la carpeta del .spk (donde está esta librería).
+  # Si no hay ninguno no se pasa "icon:" y vspk.exe usa el suyo por defecto.
+  let icon_dirs  = [env("SPORK_SCRIPT_DIR"), import.meta.dir]   # 1º la carpeta del .spk que pasa spork (Rust corre desde target/release)
+  let icon_names = ["icon.ico", "icon.png", "favicon.ico", "favicon.png"]
+  let mut icon_path = ""
+  for dir in icon_dirs {
+    for name in icon_names {
+      if icon_path == "" && dir != "" {
+        let candidate = path_join(dir, name)
+        if f_exists_q(candidate) { icon_path = candidate }
+      }
+    }
+  }
+  # Sin icono propio: icono por defecto (el del rayito), buscado hacia arriba como vspk_default.ico
+  if icon_path == "" {
+    let from_env = env("VSPK_DEFAULT_ICON")
+    if from_env != "" && f_exists_q(from_env) { icon_path = from_env }
+  }
+  if icon_path == "" {
+    let mut dir = import.meta.dir
+    for i in [0, 1, 2, 3, 4, 5, 6, 7] {
+      if icon_path == "" {
+        let candidate = path_join(dir, "vspk_default.ico")
+        if f_exists_q(candidate) { icon_path = candidate }
+        dir = path_dir(dir)
+      }
+    }
+  }
+  let icon_line = if icon_path != "" { "icon: \(icon_path)\n" } else { "" }
+
+  let close_line  = if _close_on { "on_close: confirm\n" } else { "" }
+  let htv_content = "title: \(_title)\nwidth: \(_width)\nheight: \(_height)\ndevtools: true\n\(icon_line)\(close_line)\n\(html)"
+  _icon_line = "\(icon_line)"
+  let htv_path    = temp_file("vspk_", ".htv")
+  f_write(htv_path, htv_content)
+
+  # Lanzar vspk (WebView) SIN esperarlo todavía — necesitamos seguir
+  # corriendo para atender los callbacks/eventos que llegan por el puente
+  # mientras la ventana está abierta. spawn/sleep van SIN "spk." porque
+  # spk.* solo se reconoce como statement de nivel raíz del programa —
+  # dentro de run() (una función) no se detectaría y fallaría igual que
+  # spk.server/spk.sse antes.
+  let proc = spawn([_vspk_exe, htv_path])
+  _running = true
+  for info in _wins {
+    if info["want"] { _win_open(info) }
+  }
+
+  # Evento interno "v" (lleva token): valor escrito/elegido en un widget enlazado; se guarda en _states SIN reenviarlo a la página.
+  while !proc.exited() {
+    let msg = vspk_bridge_poll()
+    if msg != nil {
+      if msg.kind == "cb" {
+        if _callbacks.has(msg.id) {
+          try { _callbacks[msg.id]() } catch { }
+        }
+      } else if msg.kind == "event" {
+        let data = try { from_json(msg.body) } else { nil }
+        let is_value = msg.name == _ev("v")
+        if is_value && data != nil {
+          let key = str(data["n"])
+          _states[key] = data["v"]
+          if len(_wins) > 0 {
+            let mut src = ""
+            if data.has("w") { src = "\(data["w"])" }
+            _push_sse("state", {"name": key, "value": data["v"], "src": src})
+          }
+        }
+        if !is_value && _events.has(msg.name) {
+          try { _events[msg.name](data) } catch { }
+        }
+      }
+    }
+    sleep(15)
+  }
+
+  # Al cerrar la ventana principal se cierran las demás.
+  for info in _wins {
+    if _win_is_open(info) == true { _win_eval(info, "__vspk.close()") }
+  }
+  sleep(300)
+  for info in _wins {
+    let hp = "\(info["htv"])"
+    if hp != "" { f_delete(hp) }
+  }
+  f_delete(htv_path)
+}

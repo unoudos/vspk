@@ -1,0 +1,20 @@
+
+# hola.spk — Hola Mundo con botón, usando vspk
+
+import "vspk.spk"
+
+let gui = App("Hola Mundo", 400, 300)
+
+let mut msg = gui.state("msg", "Pulsa el boton")
+
+gui.add(
+  Card(
+    H1("Hola Mundo"),
+    P(msg),
+    Button("Saludar", gui.on_click(fn() {
+      msg.set("Hola desde Spork!")
+    }))
+  )
+)
+
+gui.run()

@@ -1,0 +1,10 @@
+# binarios y artefactos generados
+*.exe
+*.jar
+*.old
+*.class
+*.o
+node_modules/
+target/
+__pycache__/
+*.log

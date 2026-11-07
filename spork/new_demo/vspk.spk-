@@ -1,0 +1,470 @@
+# vspk.spk — GUI nativa para Spork usando vspk como WebView
+#
+
+
+let SPORK_CSS = "spork.css"
+let SPORK_JS  = "spork.js"
+let SPORK_CSS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css"
+let SPORK_JS_CDN  = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js"
+
+# ── Estado global de la app ──────────────────────────────────────────────────
+#
+
+let _states    = {}
+let _widgets   = []
+let _callbacks = {}
+let _events    = {}
+let mut _cb_count = 0
+let mut _port      = 0
+let mut _title     = ""
+let mut _width     = 1024
+let mut _height    = 768
+let mut _theme     = "light"
+let mut _accent    = ""
+let mut _token     = ""
+let mut _key_on    = false
+let mut _close_on  = false
+let mut _running   = false
+let _timers    = []
+
+# ── Buscar ejecutable vspk ───────────────────────────────────────────────────
+
+fn find_vspk() {
+  let exe = if platform() == "win32" { "vspk.exe" } else { "vspk" }
+
+  let from_env = env("VSPK_EXE")
+  if from_env != "" && f_exists_q(from_env) { return from_env }
+
+  let beside_script = path_join(path_dir(import.meta.dir), exe)
+  if f_exists_q(beside_script) { return beside_script }
+
+  let beside_lib = path_join(import.meta.dir, exe)
+  if f_exists_q(beside_lib) { return beside_lib }
+
+  let in_path = which(exe)
+  if in_path != "" { return in_path }
+
+  exe   # fallback — el SO reportará el error
+}
+
+# ── Helpers HTML ─────────────────────────────────────────────────────────────
+
+fn html_escape(s) {
+  s
+    .replace("&",  "&amp;")
+    .replace("<",  "&lt;")
+    .replace(">",  "&gt;")
+    .replace("\"", "&quot;")
+}
+
+fn tag(t, css_class, attrs, *kids) {
+  let cls_attr   = if css_class != ""   { " class=\"\(css_class)\""  } else { "" }
+  let attrs_str  = attrs
+    .entries()
+    .map(fn(kv) {
+      let k = kv[0]
+      let v = kv[1]
+      if k == "onclick" || k == "oninput" || k == "onchange" {
+        " \(k)=\"\(v.replace("\"", "&quot;"))\""
+      } else {
+        " \(k)=\"\(html_escape(v))\""
+      }
+    })
+    .join("")
+  let inner = kids.map(fn(c) {
+    # type_of() de un objeto state()/widget devuelve "hash" en el target Rust
+    # nativo, pero "object" en el target bun/JS (ahí los hashes de Spork son
+    # objetos planos de JS — typeof {} === 'object', no hay un tipo "hash"
+    # nativo separado). Chequear solo "hash" hacía que en bun esta rama NUNCA
+    # entrara — cada H1(ciudad)/P(fecha)/etc. caía al else y terminaba
+    # interpolando el Hash entero (vía JSON.stringify, ver sporkInterpWrap en
+    # el emitter) en vez de llamar a su to_html() — eso es lo que se veía en
+    # pantalla como "{"name":{}}" en vez del texto real. Se acepta cualquiera
+    # de los dos strings para que la misma condición funcione en ambos
+    # targets sin tener que tocar el emitter.
+    if (type_of(c) == "hash" || type_of(c) == "object") && c.to_html { c.to_html() }
+    else { "\(c)" }
+  }).join("\n")
+  let void  = t == "input" || t == "hr" || t == "br"
+  if void       { "<\(t)\(cls_attr)\(attrs_str)>" }
+  else if inner == "" { "<\(t)\(cls_attr)\(attrs_str)></ \(t)>" }
+  else          { "<\(t)\(cls_attr)\(attrs_str)>\n\(inner)\n</\(t)>" }
+}
+
+# ── Widgets ──────────────────────────────────────────────────────────────────
+
+fn Row(*kids)    { tag("div",  "sz-row",           {},  ...kids) }
+fn Col(*kids)    { tag("div",  "sz-col sz-center",  {},  ...kids) }
+fn Card(*kids)   { tag("div",  "sz-card",           {},  ...kids) }
+fn Grid(*kids)   { tag("div",  "sz-grid",           {},  ...kids) }
+fn Hr()          { "<hr class=\"sz-divider\">" }
+fn Spacer()      { "<div class=\"sz-grow\"></div>" }
+
+fn H1(c)          { tag("h1",    "sz-h1",    {}, c) }
+fn H2(c)          { tag("h2",    "sz-h2",    {}, c) }
+fn H3(c)          { tag("h3",    "sz-h3",    {}, c) }
+fn H4(c)          { tag("h4",    "sz-h4",    {}, c) }
+fn P(c)           { tag("p",     "sz-p",     {}, c) }
+fn Label(c)       { tag("label", "sz-label", {}, c) }
+fn Badge(c)       { tag("span",  "sz-badge", {}, c) }
+
+fn Chip(text, primary = false) {
+  let css_class = if primary { "sz-chip sz-chip-primary" } else { "sz-chip" }
+  tag("span", css_class, {}, text)
+}
+
+fn Alert(c, variant = "") {
+  let css_class = if variant != "" { "sz-alert sz-alert-\(variant)" } else { "sz-alert" }
+  tag("div", css_class, {}, c)
+}
+
+fn Button(text, js = "", variant = "filled", size = "") {
+  let css_class   = "sz-btn sz-btn-\(variant)\(if size != "" { " sz-btn-\(size)" } else { "" })"
+  let attrs = if js != "" { {"data-ripple": "", "onclick": js} } else { {"data-ripple": ""} }
+  tag("button", css_class, attrs, text)
+}
+
+fn Input(placeholder = "", bind = nil) {
+  let attrs = {"type": "text"}
+  if placeholder != "" { attrs["placeholder"] = placeholder }
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["oninput"]         = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  tag("input", "sz-input", attrs)
+}
+
+fn Textarea(placeholder = "", rows = 4, bind = nil) {
+  let attrs = {"rows": "\(rows)"}
+  if placeholder != "" { attrs["placeholder"] = placeholder }
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["oninput"]         = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  tag("textarea", "sz-textarea", attrs)
+}
+
+fn Checkbox(label_text, bind = nil) {
+  let attrs = {"type": "checkbox"}
+  if bind != nil {
+    attrs["data-spork-checked"] = bind.name
+    attrs["onchange"] = "window.__set('\(bind.name)',this.checked);window.__sync('\(bind.name)',this.checked)"
+  }
+  let chk   = tag("input", "", attrs)
+  let track = "<span class=\"sz-switch-track\"><span class=\"sz-switch-thumb\"></span></span>"
+  let lbl   = "<span class=\"sz-switch-label\">\(label_text)</span>"
+  tag("label", "sz-switch", {}, chk, track, lbl)
+}
+
+fn Select(options, bind = nil) {
+  let opts = options.map(fn(pair) {
+    let val = pair[0]
+    let lbl = pair[1]
+    "<option value=\"\(html_escape(val))\">\(html_escape(lbl))</option>"
+  }).join("\n")
+  let attrs = {}
+  if bind != nil {
+    attrs["data-spork-bind"] = bind.name
+    attrs["onchange"] = "window.__set('\(bind.name)',this.value);window.__sync('\(bind.name)',this.value)"
+  }
+  "<select class=\"sz-select\"\(attrs.entries().map(fn(kv) { " \(kv[0])=\"\(kv[1])\"" }).join(""))>\n\(opts)\n</select>"
+}
+
+fn Progress(state) {
+  let style_expr = html_escape("{\"width\": window.__state.\(state.name) + \"%\"}")
+  "<div class=\"sz-progress\"><div class=\"sz-progress-bar\" data-spork-style=\"\(style_expr)\"></div></div>"
+}
+
+fn Avatar(src, alt = "") {
+  "<img class=\"sz-avatar\" src=\"\(html_escape(src))\" alt=\"\(html_escape(alt))\">"
+}
+
+fn Divider() { "<hr class=\"sz-divider\">" }
+
+fn _push_sse(event, data) {
+  vspk_bridge_push_sse("event: \(event)\ndata: \(to_json(data))\n\n")
+}
+
+fn _push_state(name, value) {
+  _states[name] = value
+  _push_sse("state", {"name": name, "value": value})
+}
+
+# ── State reactivo ──────────────────────────────────────────────────────────
+
+fn state(name, initial) {
+  _states[name] = initial
+
+  fn to_html() { "<span data-spork-text=\"\(name)\"></span>" }
+
+  fn js_get()       { "window.__state.\(name)" }
+  fn js_set(val)    { "window.__set('\(name)',\(to_json(val)))" }
+  fn js_inc(by = 1) { "window.__set('\(name)',window.__state.\(name)+\(by))" }
+  fn js_dec(by = 1) { "window.__set('\(name)',window.__state.\(name)-\(by))" }
+
+  fn get()       { _states[name] }
+  fn set(val)    { _push_state(name, val) }
+  fn inc(by = 1) { set(get() + by) }
+  fn dec(by = 1) { set(get() - by) }
+
+  { name, to_html, js_get, js_set, js_inc, js_dec, get, set, inc, dec,
+    __str__: fn() { to_html() } }
+}
+
+# ── Callbacks JS → Spork ────────────────────────────────────────────────────
+
+fn on_click(fn_cb) {
+  _cb_count = _cb_count + 1
+  let id = "cb_\(_token)_\(_cb_count)"
+  _callbacks[id] = fn_cb
+  "fetch('http://127.0.0.1:\(_port)/cb/\(id)',{mode:'no-cors'})"
+}
+
+fn on_event(name, fn_cb) {
+  _events[name] = fn_cb
+}
+
+# Nombre de evento interno: lleva el token de esta ejecución, así otra página no puede adivinarlo.
+fn _ev(name) { "__\(name)_\(_token)" }
+
+# JS que avisa a Spork de un evento (cuerpo = expresión JS ya serializable con JSON.stringify).
+fn _post_js(name, body_expr) {
+  "fetch('http://127.0.0.1:\(_port)/event/\(name)',{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:\(body_expr)})"
+}
+
+# Teclado: fn(e) con e["key"], e["code"], e["ctrl"], e["shift"], e["alt"], e["meta"].
+fn on_key(fn_cb) {
+  _key_on = true
+  on_event(_ev("k"), fn_cb)
+}
+
+# Cierre de ventana: se llama a fn_cb() y la ventana se cierra, salvo que devuelva false.
+# Llama a f(); si falla devuelve true (así un error en el manejador no deja la ventana sin poder cerrarse).
+fn _safe_true(f) { try { _call0(f) } else { true } }
+
+# Llamar a un callback recibido por parámetro: pasa por un hash para que cada target
+# (sobre todo Kotlin, con parámetros Any?) lo invoque de forma dinámica.
+fn _call0(f) {
+  let h = { "f": f }
+  h["f"]()
+}
+
+fn _call1(f, a) {
+  let h = { "f": f }
+  h["f"](a)
+}
+
+fn on_close(fn_cb) {
+  _close_on = true
+  on_event(_ev("c"), fn(d) {
+    let r = _safe_true(fn_cb)
+    if r == false { eval_js("__vspk.cancelClose()") }
+    if r != false { eval_js("__vspk.confirmClose()") }
+  })
+}
+
+fn _dialog(kind, title, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("d\(_cb_count)")
+  on_event(name, fn(d) { _call1(fn_cb, d["path"]) })
+  eval_js("__vspk.dialog({kind:'\(kind)',title:\(to_json(title))}).then(function(p){\(_post_js(name, "JSON.stringify({path:p})"))})")
+}
+
+# Diálogos nativos: fn_cb(ruta) — ruta es nil si el usuario cancela.
+fn pick_file(title, fn_cb)   { _dialog("open", title, fn_cb) }
+fn save_file(title, fn_cb)   { _dialog("save", title, fn_cb) }
+fn pick_folder(title, fn_cb) { _dialog("folder", title, fn_cb) }
+
+fn _timer(js_fn, ms, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("t\(_cb_count)")
+  on_event(name, fn(d) { _call0(fn_cb) })
+  let js = "\(js_fn)(function(){\(_post_js(name, "'{}'"))},\(ms))"
+  _timers.push("\(js)")
+  if _running { eval_js(js) }
+  true
+}
+
+fn run_every(ms, fn_cb) { _timer("setInterval", ms, fn_cb) }
+fn run_after(ms, fn_cb) { _timer("setTimeout", ms, fn_cb) }
+
+fn set_title(t)              { eval_js("__vspk.setTitle(\(to_json(t)))") }
+fn notify(title, body = "")  { eval_js("__vspk.notify(\(to_json(title)),\(to_json(body)))") }
+fn copy_text(text)           { eval_js("__vspk.clipboard.write(\(to_json(text)))") }
+fn quit()                    { eval_js("__vspk.close()") }
+
+fn add(*ws) {
+  for w in ws { _widgets.push("\(w)") }
+}
+
+fn eval_js(js) {
+  _push_sse("eval", js)
+}
+
+# ── Construir HTML completo ─────────────────────────────────────────────────
+
+fn _build_html() {
+  let state_json = to_json(_states)
+  let body_html  = _widgets.join("\n")
+  let key_js = if _key_on {
+    "document.addEventListener('keydown',function(e){\(_post_js(_ev("k"), "JSON.stringify({key:e.key,code:e.code,ctrl:e.ctrlKey,shift:e.shiftKey,alt:e.altKey,meta:e.metaKey})"))});"
+  } else { "" }
+  let close_js = if _close_on {
+    "window.addEventListener('vspk:closeRequested',function(){\(_post_js(_ev("c"), "'{}'"))});"
+  } else { "" }
+  let timers_js = _timers.join(";") + ";"
+  let accent_style = if _accent != "" {
+    "<style>:root{--sz-accent:\(_accent);} .sz-btn-filled{background:\(_accent);border-color:\(_accent);}</style>"
+  } else { "" }
+
+  "<!DOCTYPE html>
+<html data-theme=\"\(_theme)\">
+<head>
+  <meta charset=\"UTF-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>\(html_escape(_title))</title>
+  <link rel=\"icon\" href=\"data:,\">
+  <link rel=\"stylesheet\" href=\"\(SPORK_CSS)\" onerror=\"this.onerror=null;this.href='\(SPORK_CSS_CDN)'\">
+  \(accent_style)
+</head>
+<body class=\"sz-body\">
+
+<div id=\"__app\" class=\"sz-page\">
+\(body_html)
+</div>
+
+<script>
+window.__state = \(state_json);
+
+window.__set = function(name, value) {
+  window.__state[name] = value;
+  document.querySelectorAll('[data-spork-text=\"' + name + '\"]').forEach(function(el) {
+    el.textContent = value;
+  });
+  document.querySelectorAll('[data-spork-bind=\"' + name + '\"]').forEach(function(el) {
+    if (el.type === 'checkbox') el.checked = value;
+    else el.value = value;
+  });
+  document.querySelectorAll('[data-spork-style]').forEach(function(el) {
+    try { Object.assign(el.style, new Function('return (' + el.dataset.sporkStyle + ')')()) } catch(_){}
+  });
+  document.querySelectorAll('[data-spork-if]').forEach(function(el) {
+    try { el.style.display = new Function('return !!(' + el.dataset.sporkIf + ')')() ? '' : 'none' } catch(_){}
+  });
+  document.querySelectorAll('[data-spork-checked=\"' + name + '\"]').forEach(function(el) {
+    el.checked = !!value;
+  });
+};
+
+// Envía a Spork el valor que el usuario escribe/elige, para que state.get() lo vea
+// (los widgets enlazados solo actualizaban la página). POST simple (text/plain, no-cors).
+window.__sync = function(n, v) {
+  try {
+    fetch('http://127.0.0.1:\(_port)/event/\(_ev("v"))', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v})});
+  } catch(_) {}
+};
+
+Object.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });
+\(key_js)
+\(close_js)
+\(timers_js)
+
+(function connectSSE() {
+  var es = new EventSource('http://127.0.0.1:\(_port)/events');
+  es.addEventListener('state', function(e) {
+    var d = JSON.parse(e.data);
+    window.__set(d.name, d.value);
+  });
+  es.addEventListener('eval', function(e) {
+    try { eval(JSON.parse(e.data)); } catch(err) { console.error(err); }
+  });
+  es.onerror = function() {
+    es.close();
+    setTimeout(connectSSE, 1000);
+  };
+})();
+</script>
+<script src=\"\(SPORK_JS)\" onerror=\"var s=document.createElement('script');s.src='\(SPORK_JS_CDN)';document.body.appendChild(s)\"></script>
+</body>
+</html>"
+}
+
+# ── App — arma estado y UI, pero NO arranca nada todavía ────────────────────
+
+fn App(title, width = 1024, height = 768, theme = "light", accent = "") {
+  _title  = title
+  _width  = width
+  _height = height
+  _theme  = theme
+  _accent = accent
+  _port   = floor(rand() * 10000) + 20000
+  _token  = str(int(rand() * 1000000000)) + str(int(rand() * 1000000000)) + str(int(rand() * 1000000000))
+
+  { state, add, on_click, on_event, eval_js, run,
+    on_key, on_close, pick_file, save_file, pick_folder, run_every, run_after,
+    set_title, notify, copy_text, quit }
+}
+
+# ── run() — arranca el puente HTTP/SSE, abre la ventana, atiende eventos ────
+
+fn run() {
+  let _vspk_exe = find_vspk()
+
+  # Arranca el servidor HTTP/SSE en su propio thread — no bloquea, vuelve
+  # enseguida (ver prelude.rs: vspk_bridge_start).
+  vspk_bridge_start(_port)
+
+  let html = _build_html()
+
+  let icon_dirs  = [path_dir(import.meta.dir), import.meta.dir]
+  let icon_names = ["icon.ico", "icon.png", "favicon.ico", "favicon.png"]
+  let mut icon_path = ""
+  for dir in icon_dirs {
+    for name in icon_names {
+      if icon_path == "" {
+        let candidate = path_join(dir, name)
+        if f_exists_q(candidate) { icon_path = candidate }
+      }
+    }
+  }
+  let icon_line = if icon_path != "" { "icon: \(icon_path)\n" } else { "" }
+
+  let close_line  = if _close_on { "on_close: confirm\n" } else { "" }
+  let htv_content = "title: \(_title)\nwidth: \(_width)\nheight: \(_height)\ndevtools: true\n\(icon_line)\(close_line)\n\(html)"
+  let htv_path    = temp_file("vspk_", ".htv")
+  f_write(htv_path, htv_content)
+
+  # Lanzar vspk (WebView) SIN esperarlo todavía — necesitamos seguir
+  # corriendo para atender los callbacks/eventos que llegan por el puente
+  # mientras la ventana está abierta. spawn/sleep van SIN "spk." porque
+  # spk.* solo se reconoce como statement de nivel raíz del programa —
+  # dentro de run() (una función) no se detectaría y fallaría igual que
+  # spk.server/spk.sse antes.
+  let proc = spawn([_vspk_exe, htv_path])
+  _running = true
+
+  # Evento interno "v" (lleva token): valor escrito/elegido en un widget enlazado; se guarda en _states SIN reenviarlo a la página.
+  while !proc.exited() {
+    let msg = vspk_bridge_poll()
+    if msg != nil {
+      if msg.kind == "cb" {
+        if _callbacks.has(msg.id) {
+          try { _callbacks[msg.id]() } catch { }
+        }
+      } else if msg.kind == "event" {
+        let data = try { from_json(msg.body) } else { nil }
+        let is_value = msg.name == _ev("v")
+        if is_value && data != nil {
+          let key = str(data["n"])
+          _states[key] = data["v"]
+        }
+        if !is_value && _events.has(msg.name) {
+          try { _events[msg.name](data) } catch { }
+        }
+      }
+    }
+    sleep(15)
+  }
+
+  f_delete(htv_path)
+}

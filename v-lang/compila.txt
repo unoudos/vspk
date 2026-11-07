@@ -1,0 +1,4 @@
+v run tu_tiempo.v    hace run
+v tu_tiempo.v compila
+
+v -subsystem windows -o tu_tiempo.exe tu_tiempo.v     compia sin shell

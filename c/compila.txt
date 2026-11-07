@@ -1,0 +1,7 @@
+Compilar en Windows:
+
+gcc tu_tiempo.c -o tu_tiempo.exe -lws2_32 -lwininet -mwindows
+
+Linux:
+
+gcc tu_tiempo.c -o tu_tiempo -lpthread

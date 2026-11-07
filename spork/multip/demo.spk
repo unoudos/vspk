@@ -1,0 +1,153 @@
+
+# demo.spk — prueba de widgets de vspk (cambia #@py por #@rs / #@kt / #@js para probar cada target)
+
+import "vspk.spk"
+
+let gui = App("Demo vspk", 520, 720)
+
+# Estado compartido
+let n      = gui.state("n", 0)          # contador (lo cambia Spork)
+let m      = gui.state("m", 0)          # contador (lo cambia solo el JS de la página)
+let pct    = gui.state("pct", 0)        # barra de progreso
+let nombre = gui.state("nombre", "")    # texto del Input (solo cliente)
+let acepto = gui.state("acepto", false) # checkbox (solo cliente)
+let color  = gui.state("color", "azul") # select (solo cliente)
+let log    = gui.state("log", "—")      # última acción en Spork
+let res   = gui.state("res", "—")      # resultado de leer los campos desde Spork
+let tecla = gui.state("tecla", "—")    # última tecla pulsada
+let ticks = gui.state("ticks", 0)      # temporizador
+let arch  = gui.state("arch", "—")     # archivo elegido
+let raton = gui.state("raton", "—")    # último evento de ratón sobre el canvas
+let lienzo = gui.canvas("lienzo", 300, 150)
+#canvas
+lienzo.color("#6750A4")
+lienzo.rect(10, 10, 100, 60)
+lienzo.color("#B3261E")
+lienzo.circle(200, 60, 40)
+lienzo.color("#000000")
+lienzo.line_width(2)
+lienzo.line(0, 0, 300, 150)
+lienzo.font(16)
+lienzo.text(10, 140, "Spork")
+lienzo.on_mouse(fn(e) { raton.set("\(e["type"]) \(e["x"]),\(e["y"])") })
+#----------------------------------------------------------------
+let ajustes = gui.window("Ajustes", 360, 240)
+ajustes.add(Col(H4("Ajustes (otra ventana)"), Input("Tu nombre (compartido)", nombre), P(nombre)))
+
+let tarjeta = Card(
+    H2("Demo vspk"),
+
+    H4("1. Contador en Spork (cada clic va al puente)"),
+    Row(
+      Button("-", gui.on_click(fn() { n.dec(); log.set("n bajó") }), "outlined"),
+      H3(n),
+      Button("+", gui.on_click(fn() { n.inc(); log.set("n subió") }))
+    ),
+    Hr(),
+
+    H4("2. Contador solo JS (sin puente, debe ser instantáneo)"),
+    Row(
+      Button("-", m.js_dec(), "outlined"),
+      H3(m),
+      Button("+", m.js_inc())
+    ),
+    Hr(),
+
+    H4("3. Input enlazado"),
+    Input("Escribe tu nombre", nombre),
+    P(nombre),
+    Hr(),
+
+    H4("4. Checkbox y Select"),
+    Checkbox("Acepto las condiciones", acepto),
+    Select([["azul", "Azul"], ["verde", "Verde"], ["rojo", "Rojo"]], color),
+    P(color),
+    Hr(),
+
+    H4("5. Progreso (Spork actualiza la barra)"),
+    Progress(pct),
+    Row(
+      Button("+10%", gui.on_click(fn() {
+        if pct.get() < 100 { pct.set(pct.get() + 10) }
+        log.set("progreso \(pct.get())")
+      })),
+      Button("Reiniciar", gui.on_click(fn() { pct.set(0); log.set("reiniciado") }), "outlined")
+    ),
+    Hr(),
+
+    H4("6. Variantes y alertas"),
+    Row(Chip("normal"), Chip("primario", true), Badge("badge")),
+    Alert("Todo correcto", "success"),
+    Alert("Cuidado", "warning"),
+    Row(
+      Button("Texto", "", "text"),
+      Button("Peligro", "", "danger"),
+      Button("Pequeño", "", "filled", "sm")
+    ),
+    Hr(),
+
+    H4("7. eval_js desde Spork"),
+    Row(
+      Button("Teñir fondo", gui.on_click(fn() {
+        gui.eval_js("document.body.style.background = '#fff3cd'")
+        log.set("fondo teñido desde Spork")
+      })),
+      Button("Quitar", gui.on_click(fn() {
+        gui.eval_js("document.body.style.background = ''")
+        log.set("fondo restaurado")
+      }), "outlined")
+    ),
+    P(log),
+    Hr(),
+
+    H4("8. Spork lee los campos de arriba (3 y 4)"),
+    Button("Enviar", gui.on_click(fn() {
+      res.set("nombre=\(nombre.get())  acepto=\(acepto.get())  color=\(color.get())")
+    })),
+    P(res),
+    Hr(),
+
+    H4("9. Teclado, diálogos, temporizador, ventana"),
+    P(tecla),
+    Row(P("ticks:"), H3(ticks)),
+    Row(
+      Button("Abrir archivo...", gui.on_click(fn() {
+        gui.pick_file("Elige un archivo", fn(p) {
+          arch.set("archivo: \(p)")
+        })
+      })),
+      Button("Cambiar título", gui.on_click(fn() { gui.set_title("Hola desde Spork") })),
+      Button("Notificar", gui.on_click(fn() { gui.notify("Spork", "Hecho") }), "outlined")
+    ),
+    P(arch),
+    Hr(),
+    H4("10. Canvas"),
+    lienzo,
+    P(raton),
+    Row(
+      Button("Limpiar", gui.on_click(fn() { lienzo.erase() }), "outlined"),
+      Button("Dibujar", gui.on_click(fn() {
+        lienzo.color("#00AA00")
+        lienzo.circle(150, 75, 20)
+      }))
+    )
+  )
+
+# Los menús se crean después de la tarjeta (los ids de callback siguen el orden de creación).
+let menu = MenuBar(
+  Menu("Archivo",
+    MenuItem("Abrir ventana de ajustes", gui.on_click(fn() { ajustes.show() }), "ctrl+shift+a"),
+    MenuSep(),
+    MenuItem("Cerrar ajustes", gui.on_click(fn() { ajustes.close() }))
+  ),
+  Menu("Ayuda",
+    MenuItem("Acerca de", gui.on_click(fn() { log.set("acerca de") }))
+  )
+)
+gui.add(menu, tarjeta)
+
+gui.on_key(fn(e) { tecla.set("tecla: \(e["key"])") })
+gui.on_close(fn() { log.set("cerrando") })
+gui.run_every(1000, fn() { ticks.inc() })
+
+gui.run()

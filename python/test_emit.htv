@@ -1,0 +1,66 @@
+title: Test Canal Genérico
+width: 500
+height: 400
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #1e1e2e; color: #e0e0f0; font-family: system-ui; }
+    #app { display: flex; flex-direction: column; align-items: center;
+           gap: 1rem; padding: 2rem; }
+    #log { width: 100%; background: #2a2a3e; border-radius: 8px;
+           padding: 1rem; font-size: 13px; min-height: 100px;
+           font-family: monospace; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <h1 class="sz-h1">Canal JS &lt;-&gt; Python</h1>
+
+    <div class="sz-row">
+      <button class="sz-btn sz-btn-filled" onclick="emitir('boton_a', {btn: 'A'})">
+        Emitir A
+      </button>
+      <button class="sz-btn sz-btn-filled" onclick="emitir('boton_b', {btn: 'B', ts: Date.now()})">
+        Emitir B
+      </button>
+    </div>
+
+    <input class="sz-input" id="txt" placeholder="Escribí algo y presioná Enter"
+           style="width:100%"
+           onkeydown="if(event.key==='Enter') emitir('texto', {valor: this.value})">
+
+    <div id="log">Esperando eventos desde Python...</div>
+  </div>
+
+  <script>
+    // Emitir evento al proceso externo (Python, etc.) via IPC
+    function emitir(event, payload) {
+      window.ipc.postMessage(JSON.stringify({
+        cmd:     "emit",
+        event:   event,
+        payload: payload,
+      }));
+      log(`[JS->Python] ${event}: ${JSON.stringify(payload)}`);
+    }
+
+    // Recibir mensajes desde Python via IPC (send/broadcast)
+    window.addEventListener('message', function(e) {
+      const d = e.data;
+      if (d && d.__vspk_msg) {
+        log(`[Python->JS] ${JSON.stringify(d.__vspk_msg)}`);
+      }
+    });
+
+    function log(msg) {
+      const el = document.getElementById('log');
+      el.textContent += msg + '\n';
+      el.scrollTop = el.scrollHeight;
+    }
+  </script>
+</body>
+</html>

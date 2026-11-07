@@ -1,0 +1,784 @@
+// vspk.go — GUI nativa para Go usando vspk como WebView
+//
+// Uso:
+//   app := vspk.New("Mi App", 800, 600)
+//   count := app.State("count", 0)
+//
+//   app.Add(vspk.Col(
+//       vspk.H1(count),
+//       vspk.Row(
+//           app.Button("+1",    vspk.JS(count.Inc(1))),
+//           app.Button("Reset", vspk.JS(count.Set("0"))),
+//       ),
+//   ))
+//   app.Run()
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ── CDN ───────────────────────────────────────────────────────────────────────
+
+const (
+	sporkCSS = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css"
+	sporkJS  = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js"
+)
+
+// ── Buscar vspk executable ────────────────────────────────────────────────────
+
+func findVspk() string {
+	exe := "vspk"
+	if runtime.GOOS == "windows" {
+		exe = "vspk.exe"
+	}
+	// 1. Variable de entorno
+	if env := os.Getenv("VSPK_EXE"); env != "" {
+		if _, err := os.Stat(env); err == nil {
+			return env
+		}
+	}
+	// 2. Junto al ejecutable Go
+	if bin, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(bin), exe)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	// 3. Buscar en PATH explícitamente
+	if p, err := exec.LookPath(exe); err == nil {
+		return p
+	}
+	// 4. Rutas comunes Windows
+	if runtime.GOOS == "windows" {
+		for _, c := range []string{
+			`C:\spork\vspk.exe`,
+			`C:\spork_studio\vspk.exe`,
+			`C:\00\vspk\spkgui\target\release\vspk.exe`,
+		} {
+			if _, err := os.Stat(c); err == nil {
+				return c
+			}
+		}
+	}
+	return exe
+}
+
+// ── Estado reactivo ───────────────────────────────────────────────────────────
+
+// State representa una variable reactiva. Cuando cambia con Set(),
+// el WebView se actualiza automáticamente via SSE.
+type State struct {
+	name  string
+	value any
+	app   *App
+}
+
+func (s *State) Name() string { return s.name }
+func (s *State) Get() any     { return s.value }
+
+func (s *State) Set(value any) {
+	s.value = value
+	s.app.pushState(s.name, value)
+}
+
+// Set() desde una goroutine es seguro — pushState usa sync.
+func (s *State) SetAsync(value any) { go s.Set(value) }
+
+// Expresiones JS para usar en botones
+func (s *State) Get_js() string { return "window.__state." + s.name }
+func (s *State) Set_js(expr string) string {
+	return fmt.Sprintf("window.__set('%s',%s)", s.name, expr)
+}
+func (s *State) Inc(by float64) string {
+	if by >= 0 {
+		return fmt.Sprintf("window.__set('%s',window.__state.%s+%v)", s.name, s.name, by)
+	}
+	return fmt.Sprintf("window.__set('%s',window.__state.%s%v)", s.name, s.name, by)
+}
+func (s *State) Dec(by float64) string { return s.Inc(-by) }
+func (s *State) SetVal(expr string) string {
+	return fmt.Sprintf("window.__set('%s',%s)", s.name, expr)
+}
+
+// Span reactivo — usar directamente en widgets de texto
+func (s *State) String() string {
+	// spork.js evalúa data-spork-text como nombre de key directamente
+	return fmt.Sprintf(`<span data-spork-text="%s"></span>`, s.name)
+}
+
+// ── Widgets ───────────────────────────────────────────────────────────────────
+
+// Widget es cualquier cosa que puede renderizarse como HTML.
+type Widget interface {
+	Render() string
+}
+
+// Raw envuelve un string HTML crudo como Widget.
+type Raw string
+
+func (r Raw) Render() string { return string(r) }
+
+// JS marca un string como expresión JS para onclick (sin escapar).
+func JS(s string) string { return s }
+
+func renderChild(c any) string {
+	switch v := c.(type) {
+	case Widget:
+		return v.Render()
+	case *State:
+		return v.String()
+	case string:
+		return v
+	case fmt.Stringer:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func renderChildren(children []any) string {
+	parts := make([]string, len(children))
+	for i, c := range children {
+		parts[i] = renderChild(c)
+	}
+	return strings.Join(parts, "\n")
+}
+
+
+// ── Constructores de widgets ──────────────────────────────────────────────────
+
+type tag struct {
+	t    string
+	cls  string
+	children []any
+	attrs map[string]string
+}
+
+func (w *tag) Render() string {
+	parts := []string{}
+	if w.cls != "" {
+		parts = append(parts, fmt.Sprintf(`class="%s"`, w.cls))
+	}
+	for k, v := range w.attrs {
+		// Atributos JS: solo escapar " para que el HTML sea válido
+		if k == "onclick" || k == "oninput" || k == "onchange" {
+			v = strings.ReplaceAll(v, `"`, "&quot;")
+		} else {
+			v = htmlEscape(v)
+		}
+		parts = append(parts, fmt.Sprintf(`%s="%s"`, k, v))
+	}
+	attrStr := ""
+	if len(parts) > 0 {
+		attrStr = " " + strings.Join(parts, " ")
+	}
+	inner := renderChildren(w.children)
+	if w.t == "input" || w.t == "hr" {
+		return fmt.Sprintf("<%s%s>", w.t, attrStr)
+	}
+	if inner == "" {
+		return fmt.Sprintf("<%s%s></%s>", w.t, attrStr, w.t)
+	}
+	return fmt.Sprintf("<%s%s>\n%s\n</%s>", w.t, attrStr, inner, w.t)
+}
+
+func htmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, `"`, "&quot;")
+	return s
+}
+
+func newTag(t, cls string, children ...any) *tag {
+	return &tag{t: t, cls: cls, children: children}
+}
+
+// Layout
+func Row(children ...any) Widget  { return newTag("div", "sz-row", children...) }
+func Col(children ...any) Widget  { return newTag("div", "sz-col sz-center", children...) }
+func Card(children ...any) Widget { return newTag("div", "sz-card", children...) }
+func Grid(children ...any) Widget { return newTag("div", "sz-grid", children...) }
+func Hr() Widget                  { return Raw(`<hr class="sz-divider">`) }
+func Spacer() Widget              { return Raw(`<div class="sz-grow"></div>`) }
+
+// Texto
+func H1(content any) Widget     { return newTag("h1", "sz-h1", content) }
+func H2(content any) Widget     { return newTag("h2", "sz-h2", content) }
+func H3(content any) Widget     { return newTag("h3", "sz-h3", content) }
+func H4(content any) Widget     { return newTag("h4", "sz-h4", content) }
+func P(content any) Widget      { return newTag("p", "sz-p", content) }
+func Label(content any) Widget  { return newTag("label", "sz-label", content) }
+func Badge(content any) Widget  { return newTag("span", "sz-badge", content) }
+
+func Chip(text string, primary bool) Widget {
+	cls := "sz-chip"
+	if primary {
+		cls += " sz-chip-primary"
+	}
+	return newTag("span", cls, text)
+}
+
+func Alert(content any, variant ...string) Widget {
+	cls := "sz-alert"
+	if len(variant) > 0 && variant[0] != "" {
+		cls += " sz-alert-" + variant[0]
+	}
+	return newTag("div", cls, content)
+}
+
+func Progress(s *State) Widget {
+	style := fmt.Sprintf(`{"width": window.__state.%s + "%%"}`, s.Name())
+	return Raw(fmt.Sprintf(
+		`<div class="sz-progress"><div class="sz-progress-bar" data-spork-style="%s"></div></div>`,
+		htmlEscape(style),
+	))
+}
+
+// Button — js es la expresión JS del onclick (usar vspk.JS())
+func Button(text, js string, opts ...string) Widget {
+	variant := "filled"
+	size := ""
+	if len(opts) > 0 && opts[0] != "" { variant = opts[0] }
+	if len(opts) > 1 && opts[1] != "" { size = opts[1] }
+	cls := "sz-btn sz-btn-" + variant
+	if size != "" { cls += " sz-btn-" + size }
+	w := newTag("button", cls, text)
+	w.attrs = map[string]string{"data-ripple": ""}
+	if js != "" { w.attrs["onclick"] = js }
+	return w
+}
+
+func Input(placeholder string, bind *State) Widget {
+	w := &tag{t: "input", cls: "sz-input", attrs: map[string]string{}}
+	if placeholder != "" { w.attrs["placeholder"] = placeholder }
+	if bind != nil {
+		w.attrs["data-spork-bind"] = bind.Name()
+		w.attrs["oninput"] = fmt.Sprintf("window.__set('%s',this.value)", bind.Name())
+	}
+	return w
+}
+
+func Textarea(placeholder string, rows int, bind *State) Widget {
+	w := &tag{t: "textarea", cls: "sz-textarea", attrs: map[string]string{
+		"rows": fmt.Sprintf("%d", rows),
+	}}
+	if placeholder != "" { w.attrs["placeholder"] = placeholder }
+	if bind != nil {
+		w.attrs["data-spork-bind"] = bind.Name()
+		w.attrs["oninput"] = fmt.Sprintf("window.__set('%s',this.value)", bind.Name())
+	}
+	return w
+}
+
+func Select(options [][2]string, bind *State) Widget {
+	opts := make([]string, len(options))
+	for i, o := range options {
+		opts[i] = fmt.Sprintf(`  <option value="%s">%s</option>`, htmlEscape(o[0]), htmlEscape(o[1]))
+	}
+	onchange := ""
+	dataAttr := ""
+	if bind != nil {
+		onchange = fmt.Sprintf(` onchange="window.__set('%s',this.value)"`, bind.Name())
+		dataAttr = fmt.Sprintf(` data-spork-bind="%s"`, bind.Name())
+	}
+	return Raw(fmt.Sprintf(
+		`<select class="sz-select"%s%s>`+"\n%s\n</select>",
+		dataAttr, onchange, strings.Join(opts, "\n"),
+	))
+}
+
+func Checkbox(label string, bind *State, checked ...bool) Widget {
+	isChecked := len(checked) > 0 && checked[0]
+	checkedAttr := ""
+	if isChecked { checkedAttr = " checked" }
+	bindAttr := ""
+	if bind != nil {
+		bindAttr = fmt.Sprintf(` data-spork-bind="%s"`, bind.Name())
+	}
+	// Usa sz-switch de spork.css
+	return Raw(fmt.Sprintf(
+		`<label class="sz-switch">`+
+		`<input type="checkbox"%s%s>`+
+		`<span class="sz-switch-track"><span class="sz-switch-thumb"></span></span>`+
+		`<span class="sz-switch-label">%s</span>`+
+		`</label>`,
+		checkedAttr, bindAttr, htmlEscape(label),
+	))
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
+// App es el punto de entrada. Crea la ventana y gestiona el estado reactivo.
+type App struct {
+	title   string
+	width   int
+	height  int
+	theme   string
+	primary string
+	devtools bool
+
+	states  map[string]*State
+	root    []Widget
+	vspkExe string
+
+	// SSE
+	mu        sync.Mutex
+	clients   []chan string
+
+	// Callbacks Go ← JS
+	callbacks map[string]func()
+	handlers  map[string]func(string)
+}
+
+// New crea una nueva App con los parámetros dados.
+func New(title string, width, height int, opts ...string) *App {
+	theme := "light"
+	primary := "#6750A4"
+	if len(opts) > 0 && opts[0] != "" { theme = opts[0] }
+	if len(opts) > 1 && opts[1] != "" { primary = opts[1] }
+	return &App{
+		title:   title,
+		width:   width,
+		height:  height,
+		theme:   theme,
+		primary: primary,
+		states:  map[string]*State{},
+		vspkExe: findVspk(),
+	}
+}
+
+func (a *App) WithDevtools() *App { a.devtools = true; return a }
+
+// State crea una variable reactiva.
+func (a *App) State(name string, initial any) *State {
+	s := &State{name: name, value: initial, app: a}
+	a.states[name] = s
+	return s
+}
+
+// Add añade widgets al layout principal.
+func (a *App) Add(widgets ...Widget) *App {
+	a.root = append(a.root, widgets...)
+	return a
+}
+
+// Button con el app como receptor — alias conveniente.
+func (a *App) Button(text, js string, opts ...string) Widget {
+	return Button(text, js, opts...)
+}
+
+// Image crea una etiqueta <img> cuyo atributo src está enlazado reactivamente a un State.
+func Image(bind *State, alt ...string) Widget {
+	attrsMap := fmt.Sprintf(`{"src": "window.__state.%s"}`, bind.Name())
+	altText := ""
+	if len(alt) > 0 {
+		altText = alt[0]
+	}
+	return Raw(fmt.Sprintf(
+		`<img class="sz-img" alt="%s" data-spork-attrs="%s">`,
+		htmlEscape(altText),
+		htmlEscape(attrsMap),
+	))
+}
+
+// pushState envía un cambio de estado a todos los clientes SSE.
+// Thread-safe — puede llamarse desde cualquier goroutine.
+func (a *App) pushState(name string, value any) {
+	data, _ := json.Marshal(map[string]any{"type": "state", "key": name, "value": value})
+	msg := "data: " + string(data) + "\n\n"
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, ch := range a.clients {
+		select {
+		case ch <- msg:
+		default: // cliente lento — descartar
+		}
+	}
+}
+
+// EvalJS ejecuta JS arbitrario en el WebView via SSE.
+func (a *App) EvalJS(js string) {
+	data, _ := json.Marshal(map[string]any{"type": "eval", "value": js})
+	msg := "data: " + string(data) + "\n\n"
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, ch := range a.clients {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+func (a *App) addSSEClient(ch chan string) {
+	a.mu.Lock()
+	a.clients = append(a.clients, ch)
+	a.mu.Unlock()
+}
+
+func (a *App) removeSSEClient(ch chan string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, c := range a.clients {
+		if c == ch {
+			a.clients = append(a.clients[:i], a.clients[i+1:]...)
+			return
+		}
+	}
+}
+
+// ── HTML ──────────────────────────────────────────────────────────────────────
+
+func (a *App) buildHTML(port ...int) string {
+	sseURL := "/events"
+	if len(port) > 0 && port[0] > 0 {
+		sseURL = fmt.Sprintf("http://127.0.0.1:%d/events", port[0])
+	}
+	// Estado inicial
+	inits := []string{}
+	for name, s := range a.states {
+		v, _ := json.Marshal(s.Get())
+		inits = append(inits, fmt.Sprintf("window.__set(%q, %s);", name, v))
+	}
+	stateInit := strings.Join(inits, "\n  ")
+
+	// Body
+	parts := make([]string, len(a.root))
+	for i, w := range a.root {
+		parts[i] = w.Render()
+	}
+	body := strings.Join(parts, "\n")
+
+	darkCls := ""
+	if a.theme == "dark" { darkCls = "sz-dark" }
+
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>%s</title>
+  <link rel="stylesheet" href="%s">
+  <style>
+  :root { --sz-primary: %s; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  #app { display: flex; flex-direction: column; align-items: center;
+         padding: 2rem; min-height: 100vh; }
+  </style>
+</head>
+<body class="%s">
+  <div id="app" class="sz-page">
+%s
+  </div>
+  <script>
+  window.__state = {};
+  window.__set = function(k, v) {
+    window.__state[k] = v;
+    document.querySelectorAll('[data-spork-text]').forEach(function(el) {
+      var key = el.getAttribute('data-spork-text').replace('window.__state.', '');
+      if (key === k) el.textContent = String(v == null ? '' : v);
+    });
+    document.querySelectorAll('[data-spork-style]').forEach(function(el) {
+      var expr = el.getAttribute('data-spork-style');
+      if (expr.indexOf('window.__state.' + k) !== -1) {
+        try { var ss=Function('return ('+expr+')')(); for(var p in ss) el.style[p]=String(ss[p]); } catch(e) {}
+      }
+    });
+    document.querySelectorAll('[data-spork-if]').forEach(function(el) {
+      var expr = el.getAttribute('data-spork-if');
+      if (expr.indexOf('window.__state.' + k) !== -1) {
+        try { el.style.display = Function('return !!('+expr+')')() ? '' : 'none'; } catch(e) {}
+      }
+    });
+  };
+  %s
+  document.querySelectorAll('[data-spork-style]').forEach(function(el) {
+    try { var ss=Function('return ('+el.getAttribute('data-spork-style')+')')(); for(var p in ss) el.style[p]=String(ss[p]); } catch(e) {}
+  });
+  var __es = new EventSource('%s');
+  __es.onmessage = function(e) {
+    try {
+      var m = JSON.parse(e.data);
+      if (m.type === 'state') window.__set(m.key, m.value);
+      else if (m.type === 'eval') { eval(m.value); }
+    } catch(_) {}
+  };
+  </script>
+  <script src="%s"></script>
+  <script>if(window.Spork)Spork.init(window.__state);</script>
+</body>
+</html>`, a.title, sporkCSS, a.primary, darkCls, body, stateInit, sporkJS, sseURL)
+}
+
+// ── Servidor HTTP ─────────────────────────────────────────────────────────────
+
+func (a *App) startServer(html string) (int, *http.Server) {
+	mux := http.NewServeMux()
+
+	// HTML principal
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, html)
+	})
+
+	// SSE — estado reactivo Goroutine → WebView
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		ch := make(chan string, 32)
+		a.addSSEClient(ch)
+		defer a.removeSSEClient(ch)
+
+		flusher, ok := w.(http.Flusher)
+		ctx := r.Context()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-ch:
+				fmt.Fprint(w, msg)
+				if ok { flusher.Flush() }
+			case <-time.After(1 * time.Second):
+				fmt.Fprint(w, ": ping\n\n")
+				if ok { flusher.Flush() }
+			}
+		}
+	})
+
+	// Proxy HTTP/HTTPS sin CORS
+	mux.HandleFunc("/proxy", func(w http.ResponseWriter, r *http.Request) {
+		target := r.URL.Query().Get("url")
+		if target == "" {
+			http.Error(w, "missing url", http.StatusBadRequest)
+			return
+		}
+		decoded, err := url.QueryUnescape(target)
+		if err != nil { decoded = target }
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Get(decoded)
+		if err != nil {
+			http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" { ct = "application/octet-stream" }
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		io.Copy(w, resp.Body)
+	})
+
+	// Callbacks Go → /cb/<id>
+	mux.HandleFunc("/cb/", func(w http.ResponseWriter, r *http.Request) {
+		// Los callbacks se registran via OnEvent
+		id := strings.TrimPrefix(r.URL.Path, "/cb/")
+		a.mu.Lock()
+		fn, ok := a.callbacks[id]
+		a.mu.Unlock()
+		if ok && fn != nil {
+			go fn()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	// Eventos JS → Go: GET /event/<nombre>?data=<json>
+	//                  POST /event/<nombre>  body: JSON
+	mux.HandleFunc("/event/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/event/")
+		var payload string
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			if err == nil { payload = string(body) }
+		} else {
+			payload = r.URL.Query().Get("data")
+		}
+		a.mu.Lock()
+		fn, ok := a.handlers[name]
+		a.mu.Unlock()
+		if ok && fn != nil {
+			go fn(payload)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"ok":true}`)
+	})
+
+	// Estado: POST /state/<nombre>?v=<valor> — para que el JS actualice estado
+	// sin pasar por SSE (útil para inputs que necesitan round-trip inmediato)
+	mux.HandleFunc("/state/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		name := strings.TrimPrefix(r.URL.Path, "/state/")
+		val  := r.URL.Query().Get("v")
+		a.mu.Lock()
+		if s, ok := a.states[name]; ok {
+			s.value = val
+			// Broadcast SSE a otros clientes (si hay más de uno)
+			data, _ := json.Marshal(map[string]any{"type": "state", "key": name, "value": val})
+			msg := "data: " + string(data) + "\n\n"
+			for _, ch := range a.clients {
+				select { case ch <- msg: default: }
+			}
+		}
+		a.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic("vspk: no se pudo abrir puerto: " + err.Error())
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(ln)
+	return port, srv
+}
+
+// ── Callbacks y handlers ──────────────────────────────────────────────────────
+
+func (a *App) initMaps() {
+	if a.callbacks == nil { a.callbacks = map[string]func(){} }
+	if a.handlers == nil  { a.handlers  = map[string]func(string){} }
+}
+
+// OnClick registra una función Go como callback de botón.
+// Devuelve el JS para usar en Button: app.Button("texto", app.OnClick(fn))
+func (a *App) OnClick(fn func()) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.initMaps()
+	id := fmt.Sprintf("go_%d", len(a.callbacks)+1)
+	a.callbacks[id] = fn
+	return fmt.Sprintf("fetch('/cb/%s')", id)
+}
+
+// OnEvent registra un handler para eventos emitidos desde el JS via /event/<name>.
+// Desde el JS: fetch('/event/nombre?data='+encodeURIComponent(JSON.stringify({...})))
+func (a *App) OnEvent(name string, fn func(payload string)) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.initMaps()
+	a.handlers[name] = fn
+}
+
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+
+// Run arranca el servidor HTTP y abre la ventana vspk.
+// Bloquea hasta que la ventana se cierra.
+func (a *App) Run() {
+	a.mu.Lock()
+	a.initMaps()
+	a.mu.Unlock()
+
+	html := a.buildHTML(0) // puerto 0 = placeholder, se reemplaza abajo
+	port, srv := a.startServer(html)
+	defer srv.Close()
+
+	vspkExe := a.vspkExe
+	urlStr   := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	// ── Esperar a que el servidor HTTP esté listo (max 5s) ───────────────────
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if err == nil { conn.Close(); break }
+		if i == 49 {
+			fmt.Fprintf(os.Stderr, "[vspk] servidor no respondió — abre %s manualmente\n", urlStr)
+		}
+	}
+
+	// ── Generar .htv temporal con frontmatter — vspk lo lee directamente ─────
+	// vspk no acepta --title ni --window-size como flags; usa frontmatter .htv
+	devtoolsLine := ""
+	if a.devtools { devtoolsLine = "devtools: true\n" }
+	// Regenerar HTML con el puerto SSE real ahora que lo conocemos
+	// El EventSource apunta a http://127.0.0.1:PORT/events (servidor Go)
+	html = a.buildHTML(port)
+
+	// Embeber el HTML directamente en el .htv (sin url:)
+	// vspk detecta <!DOCTYPE, lo sirve él mismo e inyecta __vspk automáticamente
+	htvContent := fmt.Sprintf(
+		"title: %s\nwidth: %d\nheight: %d\n%s\n%s",
+		a.title, a.width, a.height, devtoolsLine, html,
+	)
+	htvFile, err := os.CreateTemp("", "vspk_*.htv")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[vspk] no se pudo crear .htv temporal: %v\n", err)
+		return
+	}
+	htvPath := htvFile.Name()
+	htvFile.WriteString(htvContent)
+	htvFile.Close()
+	defer os.Remove(htvPath)
+
+	// ── Lanzar vspk con el .htv ───────────────────────────────────────────────
+	fmt.Fprintf(os.Stderr, "[vspk] %s %s\n", vspkExe, htvPath)
+	cmd := exec.Command(vspkExe, htvPath)
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "[vspk] no se encontró %s: %v\n", vspkExe, err)
+		fmt.Fprintf(os.Stderr, "[vspk] abre %s en el navegador para debug\n", urlStr)
+		c := make(chan struct{})
+		<-c
+		return
+	}
+
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "[vspk] ventana cerrada (%v)\n", err)
+	}
+}
+
+// Notify muestra una notificación nativa del OS via EvalJS.
+// Solo funciona si la ventana está abierta.
+func (a *App) Notify(title, body string) {
+	js := fmt.Sprintf(
+		`if('Notification' in window && Notification.permission==='granted'){`+
+			`new Notification(%s,{body:%s})`+
+			`}`,
+		jsonStr(title), jsonStr(body),
+	)
+	a.EvalJS(js)
+}
+
+// SetTitle cambia el título de la ventana via EvalJS.
+func (a *App) SetTitle(title string) {
+	a.EvalJS(fmt.Sprintf("document.title = %s;", jsonStr(title)))
+}
+
+// jsonStr serializa un string a JSON con comillas.
+func jsonStr(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+

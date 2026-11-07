@@ -1,0 +1,85 @@
+
+# demo.spk — prueba de widgets de vspk (cambia #@py por #@rs / #@kt / #@js para probar cada target)
+
+import "vspk.spk"
+
+let gui = App("Demo vspk", 520, 720)
+
+# Estado compartido
+let n      = gui.state("n", 0)          # contador (lo cambia Spork)
+let m      = gui.state("m", 0)          # contador (lo cambia solo el JS de la página)
+let pct    = gui.state("pct", 0)        # barra de progreso
+let nombre = gui.state("nombre", "")    # texto del Input (solo cliente)
+let acepto = gui.state("acepto", false) # checkbox (solo cliente)
+let color  = gui.state("color", "azul") # select (solo cliente)
+let log    = gui.state("log", "—")      # última acción en Spork
+
+gui.add(
+  Card(
+    H2("Demo vspk"),
+
+    H4("1. Contador en Spork (cada clic va al puente)"),
+    Row(
+      Button("-", gui.on_click(fn() { n.dec(); log.set("n bajó") }), "outlined"),
+      H3(n),
+      Button("+", gui.on_click(fn() { n.inc(); log.set("n subió") }))
+    ),
+    Hr(),
+
+    H4("2. Contador solo JS (sin puente, debe ser instantáneo)"),
+    Row(
+      Button("-", m.js_dec(), "outlined"),
+      H3(m),
+      Button("+", m.js_inc())
+    ),
+    Hr(),
+
+    H4("3. Input enlazado"),
+    Input("Escribe tu nombre", nombre),
+    P(nombre),
+    Hr(),
+
+    H4("4. Checkbox y Select"),
+    Checkbox("Acepto las condiciones", acepto),
+    Select([["azul", "Azul"], ["verde", "Verde"], ["rojo", "Rojo"]], color),
+    P(color),
+    Hr(),
+
+    H4("5. Progreso (Spork actualiza la barra)"),
+    Progress(pct),
+    Row(
+      Button("+10%", gui.on_click(fn() {
+        if pct.get() < 100 { pct.set(pct.get() + 10) }
+        log.set("progreso \(pct.get())")
+      })),
+      Button("Reiniciar", gui.on_click(fn() { pct.set(0); log.set("reiniciado") }), "outlined")
+    ),
+    Hr(),
+
+    H4("6. Variantes y alertas"),
+    Row(Chip("normal"), Chip("primario", true), Badge("badge")),
+    Alert("Todo correcto", "success"),
+    Alert("Cuidado", "warning"),
+    Row(
+      Button("Texto", "", "text"),
+      Button("Peligro", "", "danger"),
+      Button("Pequeño", "", "filled", "sm")
+    ),
+    Hr(),
+
+    H4("7. eval_js desde Spork"),
+    Row(
+      Button("Teñir fondo", gui.on_click(fn() {
+        gui.eval_js("document.body.style.background = '#fff3cd'")
+        log.set("fondo teñido desde Spork")
+      })),
+      Button("Quitar", gui.on_click(fn() {
+        gui.eval_js("document.body.style.background = ''")
+        log.set("fondo restaurado")
+      }), "outlined")
+    ),
+    P(log)
+  )
+)
+
+gui.run()

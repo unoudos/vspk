@@ -1,0 +1,270 @@
+title: ISS Tracker
+width: 900
+height: 620
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    :root {
+      --bg:      #070b14;
+      --panel:   #0d1525;
+      --border:  #1a2a4a;
+      --accent:  #4fc3f7;
+      --green:   #69f0ae;
+      --text:    #cdd9f0;
+      --dim:     #4a6080;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Courier New', monospace;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    #header .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    #header h1 { font-size:13px; letter-spacing:3px; color:var(--accent); text-transform:uppercase; }
+    #status { margin-left:auto; font-size:11px; color:var(--dim); }
+    #main {
+      display: grid;
+      grid-template-columns: 1fr 280px;
+      flex: 1;
+      overflow: hidden;
+    }
+    #map-wrap { position:relative; overflow:hidden; border-right:1px solid var(--border); }
+    #map { width:100%; height:100%; }
+    #map-grid {
+      position:absolute; inset:0; pointer-events:none;
+      background-image:
+        linear-gradient(rgba(74,96,128,0.15) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(74,96,128,0.15) 1px, transparent 1px);
+      background-size: calc(100%/6) calc(100%/4);
+    }
+    #trail-canvas { position:absolute; inset:0; pointer-events:none; }
+    #iss-marker {
+      position:absolute; width:28px; height:28px;
+      margin:-14px 0 0 -14px;
+      transition: left 1.5s linear, top 1.5s linear;
+      filter: drop-shadow(0 0 6px var(--accent));
+    }
+    #panel { display:flex; flex-direction:column; overflow-y:auto; }
+    .stat-block { padding:14px 16px; border-bottom:1px solid var(--border); }
+    .stat-block .label { font-size:9px; letter-spacing:2px; color:var(--dim); text-transform:uppercase; margin-bottom:4px; }
+    .stat-block .value { font-size:22px; color:var(--accent); font-weight:bold; }
+    .stat-block .unit  { font-size:11px; color:var(--dim); margin-left:4px; }
+    #chart-wrap { padding:14px 16px; border-bottom:1px solid var(--border); flex:1; }
+    .chart-label { font-size:9px; letter-spacing:2px; color:var(--dim); text-transform:uppercase; margin-bottom:8px; }
+    #alt-canvas { width:100%; height:120px; display:block; }
+    #coords { padding:12px 16px; font-size:11px; color:var(--dim); line-height:1.8; }
+    #coords span { color:var(--text); }
+    #vis-block { padding:12px 16px; border-top:1px solid var(--border); }
+    #vis-text { font-size:11px; color:var(--dim); margin-top:4px; }
+  </style>
+</head>
+<body>
+<div id="header">
+  <div class="dot"></div>
+  <h1>ISS Live Tracker</h1>
+  <span id="status">Conectando...</span>
+</div>
+<div id="main">
+  <div id="map-wrap">
+    <svg id="map" viewBox="0 0 1000 500" preserveAspectRatio="xMidYMid slice">
+      <rect width="1000" height="500" fill="#070b14"/>
+      <g fill="#0d1f35" stroke="#1a2a4a" stroke-width="0.5">
+        <path d="M80,60 L180,50 L230,80 L240,120 L220,160 L180,200 L160,240 L130,280 L100,300 L80,280 L60,240 L50,180 L60,120 Z"/>
+        <path d="M160,240 L180,260 L190,300 L185,340 L170,390 L150,430 L130,450 L120,420 L125,380 L135,340 L140,300 L145,260 Z"/>
+        <path d="M420,40 L480,35 L510,50 L520,80 L500,100 L470,110 L440,100 L420,80 Z"/>
+        <path d="M440,110 L510,100 L540,120 L550,180 L545,240 L530,300 L510,350 L490,380 L470,370 L450,330 L440,280 L430,220 L425,160 L430,120 Z"/>
+        <path d="M510,40 L650,30 L750,50 L800,80 L820,120 L800,160 L750,180 L700,170 L650,180 L600,160 L560,140 L530,110 L510,80 Z"/>
+        <path d="M560,140 L630,150 L680,170 L700,200 L690,230 L660,240 L630,230 L600,210 L570,190 Z"/>
+        <path d="M720,280 L790,270 L830,290 L840,330 L820,360 L780,370 L740,350 L720,320 Z"/>
+        <path d="M230,20 L280,15 L300,30 L290,55 L260,60 L235,50 Z"/>
+        <path d="M750,30 L900,20 L950,40 L940,70 L880,80 L820,70 L770,60 Z"/>
+      </g>
+    </svg>
+    <div id="map-grid"></div>
+    <canvas id="trail-canvas"></canvas>
+    <svg id="iss-marker" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
+      <rect x="0" y="12" width="8" height="4" rx="1" fill="#4fc3f7" opacity="0.9"/>
+      <rect x="20" y="12" width="8" height="4" rx="1" fill="#4fc3f7" opacity="0.9"/>
+      <rect x="12" y="0" width="4" height="8" rx="1" fill="#4fc3f7" opacity="0.9"/>
+      <rect x="12" y="20" width="4" height="8" rx="1" fill="#4fc3f7" opacity="0.9"/>
+      <rect x="9" y="9" width="10" height="10" rx="2" fill="#cdd9f0"/>
+      <circle cx="14" cy="14" r="3" fill="#4fc3f7"/>
+    </svg>
+  </div>
+  <div id="panel">
+    <div class="stat-block">
+      <div class="label">Altitud</div>
+      <div class="value" id="alt-val">---<span class="unit">km</span></div>
+    </div>
+    <div class="stat-block">
+      <div class="label">Velocidad</div>
+      <div class="value" id="vel-val">---<span class="unit">km/h</span></div>
+    </div>
+    <div id="chart-wrap">
+      <div class="chart-label">Altitud ultimos 30 datos</div>
+      <canvas id="alt-canvas"></canvas>
+    </div>
+    <div id="coords">
+      <div>Lat <span id="lat-val">---.----</span></div>
+      <div>Lon <span id="lon-val">---.----</span></div>
+    </div>
+    <div id="vis-block">
+      <div id="vis-icon" style="font-size:20px">&#127761;</div>
+      <div id="vis-text">Calculando...</div>
+    </div>
+  </div>
+</div>
+<script>
+  // ── Canvas trail ──────────────────────────────────────────────────────────
+  const trailCanvas = document.getElementById('trail-canvas');
+  const trailCtx    = trailCanvas.getContext('2d');
+  const trail = [];
+
+  function resizeTrail() {
+    var wrap = document.getElementById('map-wrap');
+    trailCanvas.width  = wrap.offsetWidth;
+    trailCanvas.height = wrap.offsetHeight;
+  }
+  resizeTrail();
+  window.addEventListener('resize', resizeTrail);
+
+  function geoToXY(lat, lon) {
+    var wrap = document.getElementById('map-wrap');
+    return {
+      x: (lon + 180) / 360 * wrap.offsetWidth,
+      y: (90 - lat)  / 180 * wrap.offsetHeight
+    };
+  }
+
+  function drawTrail() {
+    trailCtx.clearRect(0, 0, trailCanvas.width, trailCanvas.height);
+    if (trail.length < 2) return;
+    for (var i = 1; i < trail.length; i++) {
+      if (Math.abs(trail[i].lon - trail[i-1].lon) > 180) continue;
+      var a = geoToXY(trail[i-1].lat, trail[i-1].lon);
+      var b = geoToXY(trail[i].lat,   trail[i].lon);
+      trailCtx.beginPath();
+      trailCtx.strokeStyle = 'rgba(79,195,247,' + (i / trail.length * 0.7) + ')';
+      trailCtx.lineWidth   = 1.5;
+      trailCtx.moveTo(a.x, a.y);
+      trailCtx.lineTo(b.x, b.y);
+      trailCtx.stroke();
+    }
+  }
+
+  // ── Canvas altitud ────────────────────────────────────────────────────────
+  const altCanvas = document.getElementById('alt-canvas');
+  const altCtx    = altCanvas.getContext('2d');
+  const altHistory = [];
+
+  function resizeAlt() {
+    var wrap = document.getElementById('chart-wrap');
+    altCanvas.width  = wrap.offsetWidth - 32;
+    altCanvas.height = 120;
+  }
+  resizeAlt();
+
+  function drawAltChart() {
+    var w = altCanvas.width, h = altCanvas.height;
+    altCtx.clearRect(0, 0, w, h);
+    if (altHistory.length < 2) return;
+    var min = Math.min.apply(null, altHistory) - 2;
+    var max = Math.max.apply(null, altHistory) + 2;
+    var range = max - min || 1;
+    var grad = altCtx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, 'rgba(79,195,247,0.3)');
+    grad.addColorStop(1, 'rgba(79,195,247,0)');
+    altCtx.beginPath();
+    for (var i = 0; i < altHistory.length; i++) {
+      var x = i / (altHistory.length - 1) * w;
+      var y = h - (altHistory[i] - min) / range * h;
+      i === 0 ? altCtx.moveTo(x, y) : altCtx.lineTo(x, y);
+    }
+    altCtx.strokeStyle = '#4fc3f7';
+    altCtx.lineWidth   = 2;
+    altCtx.stroke();
+    altCtx.lineTo(w, h); altCtx.lineTo(0, h); altCtx.closePath();
+    altCtx.fillStyle = grad;
+    altCtx.fill();
+  }
+
+  // ── Actualizar UI ─────────────────────────────────────────────────────────
+  function update(msg) {
+    if (msg.type !== 'iss') return;
+    var pos = geoToXY(msg.lat, msg.lon);
+    var marker = document.getElementById('iss-marker');
+    marker.style.left = pos.x + 'px';
+    marker.style.top  = pos.y + 'px';
+    trail.push({lat: msg.lat, lon: msg.lon});
+    if (trail.length > 60) trail.shift();
+    drawTrail();
+    document.getElementById('alt-val').innerHTML = Math.round(msg.alt) + '<span class="unit">km</span>';
+    document.getElementById('vel-val').innerHTML = Math.round(msg.vel).toLocaleString() + '<span class="unit">km/h</span>';
+    document.getElementById('lat-val').textContent = (msg.lat >= 0 ? '+' : '') + msg.lat.toFixed(4);
+    document.getElementById('lon-val').textContent = (msg.lon >= 0 ? '+' : '') + msg.lon.toFixed(4);
+    altHistory.push(msg.alt);
+    if (altHistory.length > 60) altHistory.shift();
+    drawAltChart();
+    document.getElementById('vis-icon').textContent = msg.visibility === 'daylight' ? '\u2600\uFE0F' : '\uD83C\uDF11';
+    document.getElementById('vis-text').textContent = msg.visibility === 'daylight' ? 'En luz solar' : 'Lado oscuro';
+    var now = new Date();
+    document.getElementById('status').textContent = 'Actualizado ' + now.toLocaleTimeString();
+  }
+
+  // ── SSE — conectar al servidor Python ─────────────────────────────────────
+  // El puerto lo mandamos via fetch a un endpoint de descubrimiento
+  // Python escribe el puerto en la URL del titulo de la ventana no es posible
+  // Usamos un rango fijo: probamos desde 19000 hasta encontrar el SSE
+  function connectSSE(port) {
+    var es = new EventSource('http://127.0.0.1:' + port + '/events');
+    es.onopen = function() {
+      document.getElementById('status').textContent = 'Conectado al puerto ' + port;
+    };
+    es.onmessage = function(e) {
+      try { update(JSON.parse(e.data)); } catch(err) {}
+    };
+    es.onerror = function() {
+      document.getElementById('status').textContent = 'Reconectando...';
+    };
+  }
+
+  // Descubrir el puerto — Python deja un archivo en el servidor de assets
+  // Lo exponemos via el asset server de vspk en /.iss_port
+  fetch('/.iss_port')
+    .then(function(r) { return r.text(); })
+    .then(function(port) { connectSSE(parseInt(port.trim())); })
+    .catch(function() {
+      // Fallback: probar puertos desde 19000
+      var port = 19000;
+      function tryNext() {
+        fetch('http://127.0.0.1:' + port + '/events', {method:'HEAD'})
+          .then(function() { connectSSE(port); })
+          .catch(function() { port++; if (port < 19100) setTimeout(tryNext, 100); });
+      }
+      tryNext();
+    });
+</script>
+</body>
+</html>
