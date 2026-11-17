@@ -281,6 +281,106 @@ fn pick_file(title, fn_cb)   { _dialog("open", title, fn_cb) }
 fn save_file(title, fn_cb)   { _dialog("save", title, fn_cb) }
 fn pick_folder(title, fn_cb) { _dialog("folder", title, fn_cb) }
 
+# ── API nativa de vspk.exe: sql, proc, serial/BLE, wifi, ping, ficheros, fetch, env ──
+# Todas son asíncronas: el resultado llega a fn_cb(resultado). Si falla, se llama a on_vspk_error(fn(msg)) o se imprime.
+# Pasa siempre todos los argumentos (usa nil o [] donde no hagan falta).
+
+let _on_error  = nil
+let _streams   = {}
+let _stream_on = false
+
+fn on_vspk_error(fn_cb) { _on_error = fn_cb }
+
+fn _call2(f, a, b) {
+  let h = { "f": f }
+  h["f"](a, b)
+}
+
+# call("__vspk.ping('1.1.1.1')", fn(r) { ... })  — evalúa una promesa JS en la página y devuelve su resultado a Spork.
+fn call(expr, fn_cb) {
+  _cb_count = _cb_count + 1
+  let name = _ev("r\(_cb_count)")
+  on_event(name, fn(d) {
+    if d != nil && d["ok"] == true {
+      if fn_cb != nil { _call1(fn_cb, d["r"]) }
+    } else {
+      let msg = if d != nil { "\(d["e"])" } else { "sin respuesta" }
+      if _on_error != nil { _call1(_on_error, msg) } else { print("[vspk] error: \(msg)") }
+    }
+  })
+  eval_js("Promise.resolve(\(expr)).then(function(r){\(_post_js(name, "JSON.stringify({ok:true,r:r})"))}).catch(function(e){\(_post_js(name, "JSON.stringify({ok:false,e:String(e&&e.message||e)})"))})")
+}
+
+# invoke("sqlOpen", {"name": "datos"}, fn(db) { ... })  — cualquier comando de vspk.exe
+fn invoke(cmd, args, fn_cb) { call("__vspk.invoke(\(to_json(cmd)),\(to_json(args)))", fn_cb) }
+
+# SQLite — una sentencia por llamada. params: [] o lista de nil/número/texto/bool.
+fn sql_open(name, fn_cb)             { call("__vspk.sql.open(\(to_json(name)))", fn_cb) }
+fn sql_exec(db, sql, params, fn_cb)  { call("__vspk.sql.exec(\(to_json(db)),\(to_json(sql)),\(to_json(params)))", fn_cb) }
+fn sql_query(db, sql, params, fn_cb) { call("__vspk.sql.query(\(to_json(db)),\(to_json(sql)),\(to_json(params)))", fn_cb) }
+fn sql_close(db, fn_cb)              { call("__vspk.sql.close(\(to_json(db)))", fn_cb) }
+
+# Ficheros, red y entorno
+fn read_file(path, fn_cb)        { call("__vspk.readFile(\(to_json(path)),'utf8')", fn_cb) }
+fn write_file(path, data, fn_cb) { call("__vspk.writeFile(\(to_json(path)),\(to_json(data)),'utf8')", fn_cb) }
+fn file_exists(path, fn_cb)      { call("__vspk.exists(\(to_json(path)))", fn_cb) }
+fn read_dir(path, fn_cb)         { call("__vspk.readDir(\(to_json(path)))", fn_cb) }
+# opts: {"method": "POST", "headers": {...}, "body": "...", "timeout": 15}  (o {})
+fn http_fetch(url, opts, fn_cb)  { call("__vspk.fetch(\(to_json(url)),\(to_json(opts)))", fn_cb) }
+fn env_get(key, fn_cb)           { call("__vspk.env(\(to_json(key)))", fn_cb) }
+fn clipboard_read(fn_cb)         { call("__vspk.clipboard.read()", fn_cb) }
+fn ping(host, timeout_ms, fn_cb) { call("__vspk.ping(\(to_json(host)),\(timeout_ms))", fn_cb) }
+fn wifi_scan(fn_cb)              { call("__vspk.wifiScan()", fn_cb) }
+
+# Streams que vspk.exe empuja a la página (proc y serial/BLE) → Spork
+fn _ensure_stream() {
+  if _stream_on { return 0 }
+  _stream_on = true
+  let name = _ev("stream")
+  on_event(name, fn(d) {
+    if d == nil { return 0 }
+    let key = if d.has("__vspk_proc") { "proc:\(d["__vspk_proc"])" } else { "serial:\(d["__vspk_serial"])" }
+    if _streams.has(key) {
+      _call1(_streams[key], d)
+    }
+  })
+  eval_js("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){\(_post_js(name, "JSON.stringify(d)"))}})}")
+}
+
+# proc_open("assets/calc", fn(kind, linea) {...}, fn(code) {...}, fn(id) {...})
+#   on_line(kind "out"|"err", linea) · on_exit(code) · fn_id(id) → id para proc_send / proc_close
+fn proc_open(path, on_line, on_exit, fn_id) {
+  _ensure_stream()
+  invoke("procOpen", {"path": path}, fn(pid) {
+    _streams["proc:\(pid)"] = fn(d) {
+      if d["k"] == "exit" { if on_exit != nil { _call1(on_exit, d["code"]) } }
+      if d["k"] != "exit" { _call2(on_line, d["k"], d["line"]) }
+    }
+    if fn_id != nil { _call1(fn_id, pid) }
+  })
+}
+fn proc_send(pid, line) { invoke("procSend", {"id": pid, "line": line}, nil) }
+fn proc_close(pid)      { invoke("procClose", {"id": pid}, nil) }
+
+# serial_list(fn(puertos) {...}, false)  → [{port, tipo, desc}] · scan=true añade los BLE cercanos como "ble:<id>"
+fn serial_list(fn_cb, scan) { invoke("serialList", {"scan": scan}, fn_cb) }
+fn ble_scan(fn_cb)          { serial_list(fn_cb, true) }
+
+# serial_open("COM3", 9600, fn(kind, linea) {...}, fn() {...}, fn(id) {...})   (o "ble:<id>")
+#   on_line(kind "data"|"err", linea) · on_close() · fn_id(id)
+fn serial_open(port, baud, on_line, on_close, fn_id) {
+  _ensure_stream()
+  invoke("serialOpen", {"port": port, "baud": baud}, fn(sid) {
+    _streams["serial:\(sid)"] = fn(d) {
+      if d["k"] == "close" { if on_close != nil { _call0(on_close) } }
+      if d["k"] != "close" { _call2(on_line, d["k"], d["line"]) }
+    }
+    if fn_id != nil { _call1(fn_id, sid) }
+  })
+}
+fn serial_write(sid, line, nl) { invoke("serialWrite", {"id": sid, "line": line, "nl": nl}, nil) }
+fn serial_close(sid)           { invoke("serialClose", {"id": sid}, nil) }
+
 # ── Diálogos modales (mensaje / confirmación / pedir texto) ──────────────────
 
 fn _modal(call, kind, fn_cb) {

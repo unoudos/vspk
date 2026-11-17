@@ -1478,3 +1478,211 @@ func findIcon() string {
 	}
 	return ""
 }
+
+// ── API nativa de vspk.exe: sql, proc, serial/BLE, wifi, ping, ficheros, fetch, env ──────────────
+// Todas son asíncronas: el resultado llega a fn(resultado, err). El resultado es el valor JSON ya
+// decodificado (float64, string, bool, []any, map[string]any o nil).
+
+// Call evalúa en la página una expresión JS que devuelve una promesa y entrega su resultado a fn.
+func (a *App) Call(expr string, fn func(result any, err error)) {
+	a.mu.Lock()
+	a.cbCount++
+	name := a.ev(fmt.Sprintf("r%d", a.cbCount))
+	a.mu.Unlock()
+	a.handle(name, func(p string) {
+		var m struct {
+			Ok bool   `json:"ok"`
+			R  any    `json:"r"`
+			E  string `json:"e"`
+		}
+		if err := json.Unmarshal([]byte(p), &m); err != nil {
+			m.Ok, m.E = false, err.Error()
+		}
+		if m.Ok {
+			if fn != nil {
+				fn(m.R, nil)
+			}
+			return
+		}
+		if fn != nil {
+			fn(nil, fmt.Errorf("%s", m.E))
+		} else {
+			fmt.Println("[vspk] error:", m.E)
+		}
+	})
+	a.EvalJS(fmt.Sprintf("Promise.resolve(%s).then(function(r){%s}).catch(function(e){%s})", expr,
+		a.postJS(name, "JSON.stringify({ok:true,r:r})"),
+		a.postJS(name, "JSON.stringify({ok:false,e:String(e&&e.message||e)})")))
+}
+
+func jsonAny(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
+}
+
+// Invoke llama a cualquier comando de vspk.exe: __vspk.invoke(cmd, args). args puede ser map, struct o nil.
+func (a *App) Invoke(cmd string, args any, fn func(result any, err error)) {
+	if args == nil {
+		args = map[string]any{}
+	}
+	a.Call(fmt.Sprintf("__vspk.invoke(%s,%s)", jsonStr(cmd), jsonAny(args)), fn)
+}
+
+// SQLite — una sentencia por llamada. params: nil o []any{1, "a", nil, true}.
+func (a *App) SQLOpen(name string, fn func(db any, err error)) {
+	a.Call("__vspk.sql.open("+jsonStr(name)+")", fn)
+}
+func (a *App) SQLExec(db any, sql string, params []any, fn func(result any, err error)) {
+	if params == nil {
+		params = []any{}
+	}
+	a.Call(fmt.Sprintf("__vspk.sql.exec(%s,%s,%s)", jsonAny(db), jsonStr(sql), jsonAny(params)), fn)
+}
+func (a *App) SQLQuery(db any, sql string, params []any, fn func(rows any, err error)) {
+	if params == nil {
+		params = []any{}
+	}
+	a.Call(fmt.Sprintf("__vspk.sql.query(%s,%s,%s)", jsonAny(db), jsonStr(sql), jsonAny(params)), fn)
+}
+func (a *App) SQLClose(db any, fn func(result any, err error)) {
+	a.Call("__vspk.sql.close("+jsonAny(db)+")", fn)
+}
+
+// Ficheros, red y entorno
+func (a *App) ReadFile(path string, fn func(text any, err error)) {
+	a.Call("__vspk.readFile("+jsonStr(path)+",'utf8')", fn)
+}
+func (a *App) WriteFile(path, data string, fn func(result any, err error)) {
+	a.Call(fmt.Sprintf("__vspk.writeFile(%s,%s,'utf8')", jsonStr(path), jsonStr(data)), fn)
+}
+func (a *App) FileExists(path string, fn func(exists any, err error)) {
+	a.Call("__vspk.exists("+jsonStr(path)+")", fn)
+}
+func (a *App) ReadDir(path string, fn func(entries any, err error)) {
+	a.Call("__vspk.readDir("+jsonStr(path)+")", fn)
+}
+
+// HTTPFetch: opts {"method":"POST","headers":map,"body":"...","timeout":15} o nil.
+func (a *App) HTTPFetch(url string, opts map[string]any, fn func(resp any, err error)) {
+	if opts == nil {
+		opts = map[string]any{}
+	}
+	a.Call(fmt.Sprintf("__vspk.fetch(%s,%s)", jsonStr(url), jsonAny(opts)), fn)
+}
+
+// Env: key == "" devuelve todas las variables de entorno.
+func (a *App) Env(key string, fn func(v any, err error)) {
+	if key == "" {
+		a.Call("__vspk.env()", fn)
+		return
+	}
+	a.Call("__vspk.env("+jsonStr(key)+")", fn)
+}
+func (a *App) ClipboardRead(fn func(text any, err error)) { a.Call("__vspk.clipboard.read()", fn) }
+func (a *App) Ping(host string, timeoutMs int, fn func(res any, err error)) {
+	if timeoutMs <= 0 {
+		timeoutMs = 2000
+	}
+	a.Call(fmt.Sprintf("__vspk.ping(%s,%d)", jsonStr(host), timeoutMs), fn)
+}
+func (a *App) WifiScan(fn func(redes any, err error)) { a.Call("__vspk.wifiScan()", fn) }
+
+// Streams que vspk.exe empuja a la página (proc y serial/BLE) → Go
+var (
+	vspkStreamMu sync.Mutex
+	vspkStreams  = map[string]func(kind, line string, code int){}
+	vspkStreamOn = map[string]bool{}
+)
+
+func (a *App) ensureStream() {
+	vspkStreamMu.Lock()
+	on := vspkStreamOn[a.token]
+	vspkStreamOn[a.token] = true
+	vspkStreamMu.Unlock()
+	if on {
+		return
+	}
+	name := a.ev("stream")
+	a.handle(name, func(p string) {
+		var m map[string]any
+		if json.Unmarshal([]byte(p), &m) != nil {
+			return
+		}
+		key := ""
+		if v, ok := m["__vspk_proc"].(float64); ok {
+			key = fmt.Sprintf("proc:%d", int(v))
+		} else if v, ok := m["__vspk_serial"].(float64); ok {
+			key = fmt.Sprintf("serial:%d", int(v))
+		} else {
+			return
+		}
+		kind, _ := m["k"].(string)
+		line, _ := m["line"].(string)
+		code := 0
+		if c, ok := m["code"].(float64); ok {
+			code = int(c)
+		}
+		vspkStreamMu.Lock()
+		cb := vspkStreams[key]
+		if kind == "exit" || kind == "close" {
+			delete(vspkStreams, key)
+		}
+		vspkStreamMu.Unlock()
+		if cb != nil {
+			cb(kind, line, code)
+		}
+	})
+	a.EvalJS("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;" +
+		"if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){" + a.postJS(name, "JSON.stringify(d)") + "}})}")
+}
+
+func (a *App) openStream(prefix, cmd string, args map[string]any, onLine func(kind, line string, code int), fn func(id int, err error)) {
+	a.ensureStream()
+	a.Invoke(cmd, args, func(r any, err error) {
+		if err != nil {
+			if fn != nil {
+				fn(-1, err)
+			}
+			return
+		}
+		f, _ := r.(float64)
+		id := int(f)
+		vspkStreamMu.Lock()
+		vspkStreams[fmt.Sprintf("%s:%d", prefix, id)] = onLine
+		vspkStreamMu.Unlock()
+		if fn != nil {
+			fn(id, nil)
+		}
+	})
+}
+
+// ProcOpen lanza un ejecutable/script de la carpeta de la app (p. ej. "assets/calc").
+// onLine(kind, line, code): kind "out"|"err" con la línea, o "exit" con el código de salida. fn recibe el id.
+func (a *App) ProcOpen(path string, onLine func(kind, line string, code int), fn func(id int, err error)) {
+	a.openStream("proc", "procOpen", map[string]any{"path": path}, onLine, fn)
+}
+func (a *App) ProcSend(id int, line string) {
+	a.Invoke("procSend", map[string]any{"id": id, "line": line}, nil)
+}
+func (a *App) ProcClose(id int) { a.Invoke("procClose", map[string]any{"id": id}, nil) }
+
+// SerialList: [{port,tipo,desc}]; scan=true añade los BLE cercanos como "ble:<id>".
+func (a *App) SerialList(scan bool, fn func(ports any, err error)) {
+	a.Invoke("serialList", map[string]any{"scan": scan}, fn)
+}
+func (a *App) BleScan(fn func(ports any, err error)) { a.SerialList(true, fn) }
+
+// SerialOpen abre un puerto ("COM3", "/dev/ttyUSB0" o "ble:<id>"). onLine: kind "data"|"err" o "close".
+func (a *App) SerialOpen(port string, baud int, onLine func(kind, line string, code int), fn func(id int, err error)) {
+	if baud <= 0 {
+		baud = 9600
+	}
+	a.openStream("serial", "serialOpen", map[string]any{"port": port, "baud": baud}, onLine, fn)
+}
+func (a *App) SerialWrite(id int, line string, nl bool) {
+	a.Invoke("serialWrite", map[string]any{"id": id, "line": line, "nl": nl}, nil)
+}
+func (a *App) SerialClose(id int) { a.Invoke("serialClose", map[string]any{"id": id}, nil) }

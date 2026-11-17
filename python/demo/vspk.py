@@ -1059,6 +1059,107 @@ class App:
     def save_file(self, title: str, fn):   self._dialog("save", title, fn)
     def pick_folder(self, title: str, fn): self._dialog("folder", title, fn)
 
+    # ── API nativa de vspk.exe (sql, proc, serial/BLE, wifi, ping, fs, fetch, env) ──
+
+    def call(self, expr: str, fn: Optional[Callable] = None, on_error: Optional[Callable] = None) -> None:
+        """Evalúa en la página una expresión JS que devuelve una promesa (p. ej. "__vspk.ping('1.1.1.1')")
+        y llama fn(resultado) en Python. Si falla: on_error(mensaje) o, por defecto, un aviso en consola."""
+        self._cb_count += 1
+        name = self._ev(f"r{self._cb_count}")
+        def _h(d):
+            if isinstance(d, dict) and d.get("ok"):
+                if fn: fn(d.get("r"))
+            else:
+                msg = d.get("e") if isinstance(d, dict) else str(d)
+                (on_error or (lambda m: print(f"[vspk] error: {m}")))(msg)
+        self._events[name] = _h
+        self.eval_js(f"Promise.resolve({expr}).then(function(r){{" + self._post_js(name, "JSON.stringify({ok:true,r:r})")
+                     + f"}}).catch(function(e){{" + self._post_js(name, "JSON.stringify({ok:false,e:String(e&&e.message||e)})") + "})")
+
+    def invoke(self, cmd: str, args: Optional[dict] = None, fn: Optional[Callable] = None, on_error: Optional[Callable] = None) -> None:
+        """Llama a cualquier comando de vspk.exe: __vspk.invoke(cmd, args)."""
+        self.call(f"__vspk.invoke({_js(cmd)},{_js(args or {})})", fn, on_error)
+
+    # SQLite — una sentencia por llamada; params: None|int|float|str|bool
+    def sql_open(self, name: str, fn=None, on_error=None):               self.call(f"__vspk.sql.open({_js(name)})", fn, on_error)
+    def sql_exec(self, db, sql: str, params=None, fn=None, on_error=None): self.call(f"__vspk.sql.exec({_js(db)},{_js(sql)},{_js(params or [])})", fn, on_error)
+    def sql_query(self, db, sql: str, params=None, fn=None, on_error=None): self.call(f"__vspk.sql.query({_js(db)},{_js(sql)},{_js(params or [])})", fn, on_error)
+    def sql_close(self, db, fn=None, on_error=None):                     self.call(f"__vspk.sql.close({_js(db)})", fn, on_error)
+
+    # Ficheros, red y entorno
+    def read_file(self, path: str, fn, enc: str = "utf8", on_error=None): self.call(f"__vspk.readFile({_js(path)},{_js(enc)})", fn, on_error)
+    def write_file(self, path: str, data: str, fn=None, enc: str = "utf8", on_error=None): self.call(f"__vspk.writeFile({_js(path)},{_js(data)},{_js(enc)})", fn, on_error)
+    def exists(self, path: str, fn, on_error=None):   self.call(f"__vspk.exists({_js(path)})", fn, on_error)
+    def read_dir(self, path: str, fn, on_error=None): self.call(f"__vspk.readDir({_js(path)})", fn, on_error)
+    def fetch(self, url: str, fn, method: str = "GET", headers=None, body=None, timeout: int = 15, on_error=None):
+        o = {"method": method, "headers": headers or {}, "timeout": timeout}
+        if body is not None: o["body"] = body
+        self.call(f"__vspk.fetch({_js(url)},{_js(o)})", fn, on_error)
+    def env(self, fn, key: Optional[str] = None, on_error=None): self.call(f"__vspk.env({_js(key) if key else ''})", fn, on_error)
+    def clipboard_read(self, fn, on_error=None):      self.call("__vspk.clipboard.read()", fn, on_error)
+    def ping(self, host: str, fn, timeout_ms: int = 2000, on_error=None): self.call(f"__vspk.ping({_js(host)},{int(timeout_ms)})", fn, on_error)
+    def wifi_scan(self, fn, on_error=None):           self.call("__vspk.wifiScan()", fn, on_error)
+
+    # Streams empujados por vspk.exe (proc y serial/BLE): window.postMessage → Python
+    def _ensure_stream(self) -> None:
+        if getattr(self, "_stream_on", False):
+            return
+        self._stream_on = True
+        self._streams = {}
+        name = self._ev("stream")
+        def _h(d):
+            if not isinstance(d, dict): return
+            key = ("proc" if "__vspk_proc" in d else "serial", d.get("__vspk_proc", d.get("__vspk_serial")))
+            cb = self._streams.get(key)
+            if cb:
+                try: cb(d)
+                except Exception as e: print(f"[vspk] error en stream {key}: {e}")
+            if d.get("k") in ("exit", "close"):
+                self._streams.pop(key, None)
+        self._events[name] = _h
+        self.eval_js("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;"
+                     "if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){" + self._post_js(name, "JSON.stringify(d)") + "}})}")
+
+    def proc_open(self, path: str, on_line: Callable[[str, str], None], on_exit: Optional[Callable[[int], None]] = None,
+                  fn: Optional[Callable[[int], None]] = None, on_error=None) -> None:
+        """Lanza un ejecutable/script de la carpeta de la app (assets/x). on_line(kind 'out'|'err', línea);
+        on_exit(code). fn(id) recibe el id para proc_send/proc_close."""
+        self._ensure_stream()
+        def _opened(pid):
+            def _cb(d):
+                if d.get("k") == "exit":
+                    if on_exit: on_exit(d.get("code", 0))
+                else:
+                    on_line(d.get("k", "out"), d.get("line", ""))
+            self._streams[("proc", pid)] = _cb
+            if fn: fn(pid)
+        self.invoke("procOpen", {"path": path}, _opened, on_error)
+
+    def proc_send(self, pid: int, line: str):  self.invoke("procSend", {"id": pid, "line": line})
+    def proc_close(self, pid: int):            self.invoke("procClose", {"id": pid})
+
+    def serial_list(self, fn, scan: bool = False, on_error=None):
+        """Lista puertos [{port,tipo,desc}]; scan=True añade los BLE cercanos como 'ble:<id>'."""
+        self.invoke("serialList", {"scan": scan}, fn, on_error)
+    ble_scan = lambda self, fn, on_error=None: self.serial_list(fn, True, on_error)
+
+    def serial_open(self, port: str, on_line: Callable[[str, str], None], baud: int = 9600,
+                    on_close: Optional[Callable[[], None]] = None, fn: Optional[Callable[[int], None]] = None, on_error=None) -> None:
+        """Abre un puerto serie (o 'ble:<id>'). on_line(kind 'data'|'err', línea); fn(id)."""
+        self._ensure_stream()
+        def _opened(sid):
+            def _cb(d):
+                if d.get("k") == "close":
+                    if on_close: on_close()
+                else:
+                    on_line(d.get("k", "data"), d.get("line", ""))
+            self._streams[("serial", sid)] = _cb
+            if fn: fn(sid)
+        self.invoke("serialOpen", {"port": port, "baud": baud}, _opened, on_error)
+
+    def serial_write(self, sid: int, line: str, nl: bool = True): self.invoke("serialWrite", {"id": sid, "line": line, "nl": nl})
+    def serial_close(self, sid: int):                              self.invoke("serialClose", {"id": sid})
+
     # ── Diálogos modales (mensaje / confirmación / pedir texto) ──────────────
 
     def _modal(self, js_call: str, conv: Callable, fn: Optional[Callable]) -> None:

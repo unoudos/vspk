@@ -519,6 +519,84 @@ export class App {
     saveFile(title, fn)   { this._dialog("save", title, fn) }
     pickFolder(title, fn) { this._dialog("folder", title, fn) }
 
+    // ── API nativa de vspk.exe (sql, proc, serial/BLE, wifi, ping, fs, fetch, env) ──
+    /** Evalúa en la página una expresión JS que devuelve una promesa y llama fn(resultado, error). */
+    call(expr, fn) {
+        const name = this._ev(`r${++this._cbCount}`)
+        this._events.set(name, (d) => {
+            if (!fn) return
+            if (d && d.ok) fn(d.r, null)
+            else { const e = d && d.e ? d.e : String(d); if (fn.length >= 2) fn(null, e); else console.error("[vspk] error:", e) }
+        })
+        this.evalJs(`Promise.resolve(${expr}).then(function(r){${this._postJs(name, "JSON.stringify({ok:true,r:r})")}})`
+            + `.catch(function(e){${this._postJs(name, "JSON.stringify({ok:false,e:String(e&&e.message||e)})")}})`)
+    }
+    /** Cualquier comando de vspk.exe: __vspk.invoke(cmd, args). */
+    invoke(cmd, args, fn) { this.call(`__vspk.invoke(${js(cmd)},${js(args || {})})`, fn) }
+
+    // SQLite — una sentencia por llamada
+    sqlOpen(name, fn)            { this.call(`__vspk.sql.open(${js(name)})`, fn) }
+    sqlExec(db, sql, params, fn) { this.call(`__vspk.sql.exec(${js(db)},${js(sql)},${js(params || [])})`, fn) }
+    sqlQuery(db, sql, params, fn){ this.call(`__vspk.sql.query(${js(db)},${js(sql)},${js(params || [])})`, fn) }
+    sqlClose(db, fn)             { this.call(`__vspk.sql.close(${js(db)})`, fn) }
+
+    // Ficheros, red y entorno
+    readFile(path, fn, enc = "utf8")        { this.call(`__vspk.readFile(${js(path)},${js(enc)})`, fn) }
+    writeFile(path, data, fn, enc = "utf8") { this.call(`__vspk.writeFile(${js(path)},${js(data)},${js(enc)})`, fn) }
+    exists(path, fn)   { this.call(`__vspk.exists(${js(path)})`, fn) }
+    readDir(path, fn)  { this.call(`__vspk.readDir(${js(path)})`, fn) }
+    fetch(url, fn, opts = {}) { this.call(`__vspk.fetch(${js(url)},${js(opts)})`, fn) }
+    env(fn, key)       { this.call(`__vspk.env(${key ? js(key) : ""})`, fn) }
+    clipboardRead(fn)  { this.call("__vspk.clipboard.read()", fn) }
+    ping(host, fn, timeoutMs = 2000) { this.call(`__vspk.ping(${js(host)},${timeoutMs | 0})`, fn) }
+    wifiScan(fn)       { this.call("__vspk.wifiScan()", fn) }
+
+    // Streams empujados por vspk.exe (proc y serial/BLE): window.postMessage → Node
+    _ensureStream() {
+        if (this._streamOn) return
+        this._streamOn = true
+        this._streams = new Map()
+        const name = this._ev("stream")
+        this._events.set(name, (d) => {
+            if (!d || typeof d !== "object") return
+            const isProc = d.__vspk_proc != null
+            const key = (isProc ? "proc:" : "serial:") + (isProc ? d.__vspk_proc : d.__vspk_serial)
+            const cb = this._streams.get(key)
+            if (cb) { try { cb(d) } catch (e) { console.error("[vspk] error en stream", key, e) } }
+            if (d.k === "exit" || d.k === "close") this._streams.delete(key)
+        })
+        this.evalJs("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;"
+            + "if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){" + this._postJs(name, "JSON.stringify(d)") + "}})}")
+    }
+    /** Lanza assets/x. onLine(kind 'out'|'err', línea), onExit(code), fn(id). */
+    procOpen(path, onLine, onExit, fn) {
+        this._ensureStream()
+        this.invoke("procOpen", { path }, (pid) => {
+            this._streams.set("proc:" + pid, (d) => {
+                if (d.k === "exit") { if (onExit) onExit(d.code ?? 0) } else onLine(d.k || "out", d.line || "")
+            })
+            if (fn) fn(pid)
+        })
+    }
+    procSend(pid, line) { this.invoke("procSend", { id: pid, line }) }
+    procClose(pid)      { this.invoke("procClose", { id: pid }) }
+
+    /** Puertos [{port,tipo,desc}]; scan=true añade los BLE cercanos como "ble:<id>". */
+    serialList(fn, scan = false) { this.invoke("serialList", { scan }, fn) }
+    bleScan(fn)                  { this.serialList(fn, true) }
+    /** Abre un puerto serie o "ble:<id>". onLine(kind 'data'|'err', línea), onClose(), fn(id). */
+    serialOpen(port, onLine, baud = 9600, onClose, fn) {
+        this._ensureStream()
+        this.invoke("serialOpen", { port, baud }, (sid) => {
+            this._streams.set("serial:" + sid, (d) => {
+                if (d.k === "close") { if (onClose) onClose() } else onLine(d.k || "data", d.line || "")
+            })
+            if (fn) fn(sid)
+        })
+    }
+    serialWrite(sid, line, nl = true) { this.invoke("serialWrite", { id: sid, line, nl }) }
+    serialClose(sid)                  { this.invoke("serialClose", { id: sid }) }
+
     // ── Diálogos modales (mensaje / confirmación / pedir texto) ──
     _modal(call, conv, fn) {
         const name = this._ev(`m${++this._cbCount}`)

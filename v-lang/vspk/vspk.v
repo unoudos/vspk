@@ -743,6 +743,8 @@ mut:
 	wins     []&Window
 	counter  int
 	htvn     int
+	streams  map[string]fn (string, string, int)
+	stream_on bool
 	key_on   bool
 	close_on bool
 	running  bool
@@ -928,6 +930,180 @@ pub fn (a &App) save_file(title string, f fn (string)) {
 
 pub fn (a &App) pick_folder(title string, f fn (string)) {
 	a.dialog('folder', title, f)
+}
+
+// ── API nativa de vspk.exe: sql, proc, serial/BLE, wifi, ping, ficheros, fetch, env ─────────────
+// Todas son asíncronas: el resultado llega a f(ok, json). ok=true → json es el resultado en JSON
+// (número, "texto" con comillas, [..], {..}); ok=false → json es el mensaje de error.
+// Los argumentos JSON (params, opts) se pasan como texto JSON: '[1,"a",null]', '{}'.
+
+// Evalúa en la página una expresión JS que devuelve una promesa y entrega su resultado (JSON) a f.
+pub fn (a &App) call(expr string, f fn (bool, string)) {
+	name := a.ev('r${a.next_id()}')
+	a.add_ev(name, fn [f] (body string) {
+		if jbool(body, 'ok') {
+			r, _ := jstr(body, 'r')
+			f(true, r)
+		} else {
+			e, _ := jstr(body, 'e')
+			f(false, e)
+		}
+	})
+	ok_js := a.post_js(name, 'JSON.stringify({ok:true,r:JSON.stringify(r===undefined?null:r)})')
+	err_js := a.post_js(name, 'JSON.stringify({ok:false,e:String(e&&e.message||e)})')
+	a.eval_js('Promise.resolve(${expr}).then(function(r){${ok_js}}).catch(function(e){${err_js}})')
+}
+
+// Cualquier comando de vspk.exe: __vspk.invoke(cmd, args). args_json: objeto JSON ('{}' si no hay).
+pub fn (a &App) invoke(cmd string, args_json string, f fn (bool, string)) {
+	args := if args_json == '' { '{}' } else { args_json }
+	a.call('__vspk.invoke(${js_str(cmd)},${args})', f)
+}
+
+fn noop_res(_ bool, _ string) {}
+
+// SQLite — una sentencia por llamada. db es lo que devolvió sql_open (JSON tal cual). params: '[]' o '[1,"a",null]'.
+pub fn (a &App) sql_open(name string, f fn (bool, string)) {
+	a.call('__vspk.sql.open(${js_str(name)})', f)
+}
+
+pub fn (a &App) sql_exec(db string, sql string, params_json string, f fn (bool, string)) {
+	p := if params_json == '' { '[]' } else { params_json }
+	a.call('__vspk.sql.exec(${db},${js_str(sql)},${p})', f)
+}
+
+pub fn (a &App) sql_query(db string, sql string, params_json string, f fn (bool, string)) {
+	p := if params_json == '' { '[]' } else { params_json }
+	a.call('__vspk.sql.query(${db},${js_str(sql)},${p})', f)
+}
+
+pub fn (a &App) sql_close(db string, f fn (bool, string)) {
+	a.call('__vspk.sql.close(${db})', f)
+}
+
+// Ficheros, red y entorno
+pub fn (a &App) read_file(path string, f fn (bool, string)) {
+	a.call('__vspk.readFile(${js_str(path)},"utf8")', f)
+}
+
+pub fn (a &App) write_file(path string, data string, f fn (bool, string)) {
+	a.call('__vspk.writeFile(${js_str(path)},${js_str(data)},"utf8")', f)
+}
+
+pub fn (a &App) file_exists(path string, f fn (bool, string)) {
+	a.call('__vspk.exists(${js_str(path)})', f)
+}
+
+pub fn (a &App) read_dir(path string, f fn (bool, string)) {
+	a.call('__vspk.readDir(${js_str(path)})', f)
+}
+
+// opts_json: '{"method":"POST","headers":{...},"body":"...","timeout":15}' o '{}'
+pub fn (a &App) http_fetch(url string, opts_json string, f fn (bool, string)) {
+	o := if opts_json == '' { '{}' } else { opts_json }
+	a.call('__vspk.fetch(${js_str(url)},${o})', f)
+}
+
+pub fn (a &App) env_get(key string, f fn (bool, string)) {
+	k := if key == '' { '' } else { js_str(key) }
+	a.call('__vspk.env(${k})', f)
+}
+
+pub fn (a &App) clipboard_read(f fn (bool, string)) {
+	a.call('__vspk.clipboard.read()', f)
+}
+
+pub fn (a &App) ping(host string, timeout_ms int, f fn (bool, string)) {
+	t := if timeout_ms > 0 { timeout_ms } else { 2000 }
+	a.call('__vspk.ping(${js_str(host)},${t})', f)
+}
+
+pub fn (a &App) wifi_scan(f fn (bool, string)) {
+	a.call('__vspk.wifiScan()', f)
+}
+
+// Streams que vspk.exe empuja a la página (proc y serial/BLE) → V
+fn (a &App) ensure_stream() {
+	if a.stream_on {
+		return
+	}
+	mut me := unsafe { a }
+	me.stream_on = true
+	name := a.ev('stream')
+	a.add_ev(name, fn [a] (body string) {
+		mut key := ''
+		if jfind(body, '__vspk_proc') >= 0 {
+			key = 'proc:${int(jnum(body, '__vspk_proc'))}'
+		} else if jfind(body, '__vspk_serial') >= 0 {
+			key = 'serial:${int(jnum(body, '__vspk_serial'))}'
+		} else {
+			return
+		}
+		kind, _ := jstr(body, 'k')
+		line, _ := jstr(body, 'line')
+		code := int(jnum(body, 'code'))
+		cb := a.streams[key] or { return }
+		if kind == 'exit' || kind == 'close' {
+			mut m2 := unsafe { a }
+			m2.streams.delete(key)
+		}
+		cb(kind, line, code)
+	})
+	post := a.post_js(name, 'JSON.stringify(d)')
+	a.eval_js("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){${post}}})}")
+}
+
+fn (a &App) open_stream(prefix string, cmd string, args_json string, on_line fn (string, string, int), f fn (int)) {
+	a.ensure_stream()
+	a.invoke(cmd, args_json, fn [a, prefix, on_line, f] (ok bool, r string) {
+		if !ok {
+			eprintln('[vspk] error: ${r}')
+			f(-1)
+			return
+		}
+		id := r.int()
+		mut me := unsafe { a }
+		me.streams['${prefix}:${id}'] = on_line
+		f(id)
+	})
+}
+
+// Lanza un ejecutable/script de la carpeta de la app (p. ej. 'assets/calc').
+// on_line(kind, line, code): kind 'out'|'err' con la línea, o 'exit' con el código de salida.
+// f(id) recibe el id para proc_send / proc_close (-1 si falló). Pasa fn (_ int) {} si no lo necesitas.
+pub fn (a &App) proc_open(path string, on_line fn (string, string, int), f fn (int)) {
+	a.open_stream('proc', 'procOpen', '{"path":${js_str(path)}}', on_line, f)
+}
+
+pub fn (a &App) proc_send(id int, line string) {
+	a.invoke('procSend', '{"id":${id},"line":${js_str(line)}}', noop_res)
+}
+
+pub fn (a &App) proc_close(id int) {
+	a.invoke('procClose', '{"id":${id}}', noop_res)
+}
+
+// Puertos [{port,tipo,desc}]; scan=true añade los BLE cercanos como 'ble:<id>'.
+pub fn (a &App) serial_list(scan bool, f fn (bool, string)) {
+	a.invoke('serialList', '{"scan":${scan}}', f)
+}
+
+pub fn (a &App) ble_scan(f fn (bool, string)) {
+	a.serial_list(true, f)
+}
+
+// Abre un puerto ('COM3', '/dev/ttyUSB0' o 'ble:<id>'). on_line(kind, line, code): kind 'data'|'err' o 'close'.
+pub fn (a &App) serial_open(port string, baud int, on_line fn (string, string, int), f fn (int)) {
+	b := if baud > 0 { baud } else { 9600 }
+	a.open_stream('serial', 'serialOpen', '{"port":${js_str(port)},"baud":${b}}', on_line, f)
+}
+
+pub fn (a &App) serial_write(id int, line string, nl bool) {
+	a.invoke('serialWrite', '{"id":${id},"line":${js_str(line)},"nl":${nl}}', noop_res)
+}
+
+pub fn (a &App) serial_close(id int) {
+	a.invoke('serialClose', '{"id":${id}}', noop_res)
 }
 
 // ── Diálogos modales (mensaje / confirmación / pedir texto) ──────────────────

@@ -598,6 +598,145 @@ static void vspk_pick_file(VspkApp *app, const char *title, VspkPathFn fn, void 
 static void vspk_save_file(VspkApp *app, const char *title, VspkPathFn fn, void *ud)   { vspk__dialog(app, "save", title, fn, ud); }
 static void vspk_pick_folder(VspkApp *app, const char *title, VspkPathFn fn, void *ud) { vspk__dialog(app, "folder", title, fn, ud); }
 
+/* ── API nativa de vspk.exe: sql, proc, serial/BLE, wifi, ping, ficheros, fetch, env ─────────────
+ * Todas son asíncronas: el resultado llega a fn(ok, json, ud). ok=1 → json es el resultado en JSON
+ * (número, "texto" entre comillas, [..], {..}); ok=0 → json es el mensaje de error. Los argumentos
+ * que son JSON (params, opts) se pasan ya como texto JSON, p. ej. "[1,\"a\"]" o "{}" (NULL = vacío). */
+
+typedef void (*VspkResultFn)(int ok, const char *json, void *ud);
+typedef void (*VspkIdFn)(int id, void *ud);                                   /* id < 0 si falló la apertura */
+typedef void (*VspkLineFn)(const char *kind, const char *line, void *ud);     /* kind: out|err (proc) · data|err (serial) · exit|close (line = código) */
+
+typedef struct { VspkResultFn fn; void *ud; } VspkResTramp;
+static void vspk__restramp(const char *body, void *ud) {
+    VspkResTramp *t = (VspkResTramp *)ud;
+    const char *ok = vspk__jfind(body, "ok");
+    if (!t->fn) return;
+    if (ok && strncmp(ok, "true", 4) == 0) { char *r = vspk__jstr(body, "r"); t->fn(1, r ? r : "null", t->ud); free(r); }
+    else { char *e = vspk__jstr(body, "e"); t->fn(0, e ? e : "error", t->ud); free(e); }
+}
+/* Evalúa en la página una expresión JS que devuelve una promesa y entrega su resultado (como JSON) a fn. */
+static void vspk_call(VspkApp *app, const char *expr, VspkResultFn fn, void *ud) {
+    char nm[64], tag[24]; VspkBuf b = {0}, ok = {0}, bad = {0};
+    VspkResTramp *t = (VspkResTramp *)calloc(1, sizeof *t); t->fn = fn; t->ud = ud;
+    snprintf(tag, sizeof tag, "r%d", ++app->counter); vspk__evname(app, nm, sizeof nm, tag);
+    vspk__ev_add(app, nm, VSPK_EV_USER, (void *)vspk__restramp, t, NULL);
+    vspk__postjs(app, &ok, nm, "JSON.stringify({ok:true,r:JSON.stringify(r===undefined?null:r)})");
+    vspk__postjs(app, &bad, nm, "JSON.stringify({ok:false,e:String(e&&e.message||e)})");
+    vspk__bf(&b, "Promise.resolve(%s).then(function(r){%s}).catch(function(e){%s})", expr, vspk__bstr(&ok), vspk__bstr(&bad));
+    vspk_eval(app, vspk__bstr(&b)); free(b.p); free(ok.p); free(bad.p);
+}
+/* Cualquier comando de vspk.exe: __vspk.invoke(cmd, args). args_json: objeto JSON o NULL. */
+static void vspk_invoke(VspkApp *app, const char *cmd, const char *args_json, VspkResultFn fn, void *ud) {
+    VspkBuf b = {0}; vspk__bcat(&b, "__vspk.invoke("); vspk__bjs(&b, cmd); vspk__bc(&b, ',');
+    vspk__bcat(&b, args_json && *args_json ? args_json : "{}"); vspk__bc(&b, ')');
+    vspk_call(app, vspk__bstr(&b), fn, ud); free(b.p);
+}
+/* Llama a un método de __vspk con 1..3 argumentos que son literales JS ya construidos. */
+static void vspk__call_s(VspkApp *app, const char *fnname, const char *a1, const char *s2, const char *raw3, VspkResultFn fn, void *ud) {
+    VspkBuf b = {0}; vspk__bf(&b, "__vspk.%s(", fnname);
+    if (a1) vspk__bjs(&b, a1);
+    if (s2) { vspk__bc(&b, ','); vspk__bjs(&b, s2); }
+    if (raw3) { vspk__bc(&b, ','); vspk__bcat(&b, raw3); }
+    vspk__bc(&b, ')'); vspk_call(app, vspk__bstr(&b), fn, ud); free(b.p);
+}
+
+/* SQLite — una sentencia por llamada. params_json: "[]" o "[1,\"a\",null]". */
+static void vspk_sql_open(VspkApp *app, const char *name, VspkResultFn fn, void *ud) { vspk__call_s(app, "sql.open", name, NULL, NULL, fn, ud); }
+static void vspk_sql_close(VspkApp *app, const char *db, VspkResultFn fn, void *ud)  { vspk__call_s(app, "sql.close", db, NULL, NULL, fn, ud); }
+static void vspk__sql2(VspkApp *app, const char *m, const char *db, const char *sql, const char *params_json, VspkResultFn fn, void *ud) {
+    VspkBuf b = {0}; vspk__bf(&b, "__vspk.sql.%s(", m); vspk__bjs(&b, db); vspk__bc(&b, ','); vspk__bjs(&b, sql);
+    vspk__bc(&b, ','); vspk__bcat(&b, params_json && *params_json ? params_json : "[]"); vspk__bc(&b, ')');
+    vspk_call(app, vspk__bstr(&b), fn, ud); free(b.p);
+}
+static void vspk_sql_exec(VspkApp *app, const char *db, const char *sql, const char *params_json, VspkResultFn fn, void *ud)  { vspk__sql2(app, "exec", db, sql, params_json, fn, ud); }
+static void vspk_sql_query(VspkApp *app, const char *db, const char *sql, const char *params_json, VspkResultFn fn, void *ud) { vspk__sql2(app, "query", db, sql, params_json, fn, ud); }
+
+/* Ficheros, red y entorno */
+static void vspk_read_file(VspkApp *app, const char *path, VspkResultFn fn, void *ud)  { vspk__call_s(app, "readFile", path, "utf8", NULL, fn, ud); }
+static void vspk_write_file(VspkApp *app, const char *path, const char *data, VspkResultFn fn, void *ud) {
+    VspkBuf b = {0}; vspk__bcat(&b, "__vspk.writeFile("); vspk__bjs(&b, path); vspk__bc(&b, ','); vspk__bjs(&b, data); vspk__bcat(&b, ",'utf8')");
+    vspk_call(app, vspk__bstr(&b), fn, ud); free(b.p);
+}
+static void vspk_file_exists(VspkApp *app, const char *path, VspkResultFn fn, void *ud) { vspk__call_s(app, "exists", path, NULL, NULL, fn, ud); }
+static void vspk_read_dir(VspkApp *app, const char *path, VspkResultFn fn, void *ud)    { vspk__call_s(app, "readDir", path, NULL, NULL, fn, ud); }
+/* opts_json: {"method":"POST","headers":{...},"body":"...","timeout":15} o NULL */
+static void vspk_fetch(VspkApp *app, const char *url, const char *opts_json, VspkResultFn fn, void *ud) { vspk__call_s(app, "fetch", url, NULL, opts_json && *opts_json ? opts_json : "{}", fn, ud); }
+static void vspk_env(VspkApp *app, const char *key, VspkResultFn fn, void *ud) { vspk__call_s(app, "env", key, NULL, NULL, fn, ud); }
+static void vspk_clipboard_read(VspkApp *app, VspkResultFn fn, void *ud) { vspk_call(app, "__vspk.clipboard.read()", fn, ud); }
+static void vspk_ping(VspkApp *app, const char *host, int timeout_ms, VspkResultFn fn, void *ud) {
+    char t[24]; snprintf(t, sizeof t, "%d", timeout_ms > 0 ? timeout_ms : 2000); vspk__call_s(app, "ping", host, NULL, t, fn, ud);
+}
+static void vspk_wifi_scan(VspkApp *app, VspkResultFn fn, void *ud) { vspk_call(app, "__vspk.wifiScan()", fn, ud); }
+
+/* Streams que vspk.exe empuja a la página (proc y serial/BLE) → C */
+typedef struct { int kind, id; VspkLineFn fn; void *ud; } VspkStream;      /* kind 1 = proc, 2 = serial */
+static VspkStream *vspk__streams = NULL; static int vspk__nstreams = 0, vspk__stream_on = 0;
+
+static void vspk__stream_ev(const char *body, void *ud) {
+    const char *pp = vspk__jfind(body, "__vspk_proc"), *sp = vspk__jfind(body, "__vspk_serial");
+    int kind = pp ? 1 : 2, id = atoi(pp ? pp : (sp ? sp : "-1")), i; char *k = vspk__jstr(body, "k"), *line = vspk__jstr(body, "line");
+    (void)ud;
+    for (i = 0; i < vspk__nstreams; i++) {
+        VspkStream *s = &vspk__streams[i];
+        if (s->kind == kind && s->id == id) {
+            char code[24]; const char *l = line ? line : "";
+            if (k && (strcmp(k, "exit") == 0)) { const char *c = vspk__jfind(body, "code"); snprintf(code, sizeof code, "%d", c ? atoi(c) : 0); l = code; }
+            if (s->fn) s->fn(k ? k : "", l, s->ud);
+            if (k && (strcmp(k, "exit") == 0 || strcmp(k, "close") == 0)) { vspk__streams[i] = vspk__streams[--vspk__nstreams]; }
+            break;
+        }
+    }
+    free(k); free(line);
+}
+static void vspk__ensure_stream(VspkApp *app) {
+    char nm[64]; VspkBuf b = {0}, body = {0};
+    if (vspk__stream_on) return;
+    vspk__stream_on = 1; vspk__evname(app, nm, sizeof nm, "stream");
+    vspk__ev_add(app, nm, VSPK_EV_USER, (void *)vspk__stream_ev, NULL, NULL);
+    vspk__postjs(app, &body, nm, "JSON.stringify(d)");
+    vspk__bf(&b, "if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){%s}})}", vspk__bstr(&body));
+    vspk_eval(app, vspk__bstr(&b)); free(b.p); free(body.p);
+}
+typedef struct { int kind; VspkLineFn line; void *line_ud; VspkIdFn idfn; void *id_ud; } VspkOpenCtx;
+static void vspk__opened(int ok, const char *json, void *ud) {
+    VspkOpenCtx *c = (VspkOpenCtx *)ud; int id = ok ? atoi(json) : -1;
+    if (ok) { VspkStream s; s.kind = c->kind; s.id = id; s.fn = c->line; s.ud = c->line_ud; VSPK_MASK_PUSH(vspk__streams, vspk__nstreams, VspkStream, s); }
+    else fprintf(stderr, "[vspk] error: %s\n", json);
+    if (c->idfn) c->idfn(id, c->id_ud);
+    free(c);
+}
+static void vspk__open_stream(VspkApp *app, int kind, const char *cmd, const char *args_json, VspkLineFn line, void *line_ud, VspkIdFn idfn, void *id_ud) {
+    VspkOpenCtx *c = (VspkOpenCtx *)calloc(1, sizeof *c); c->kind = kind; c->line = line; c->line_ud = line_ud; c->idfn = idfn; c->id_ud = id_ud;
+    vspk__ensure_stream(app); vspk_invoke(app, cmd, args_json, vspk__opened, c);
+}
+
+/* Lanza un ejecutable/script de la carpeta de la app (p. ej. "assets/calc"). on_line("out"|"err", línea) y
+ * on_line("exit", "<código>"); idfn(id) recibe el id para vspk_proc_send / vspk_proc_close. */
+static void vspk_proc_open(VspkApp *app, const char *path, VspkLineFn on_line, void *ud, VspkIdFn idfn, void *id_ud) {
+    VspkBuf a = {0}; vspk__bcat(&a, "{\"path\":"); vspk__bjs(&a, path); vspk__bc(&a, '}');
+    vspk__open_stream(app, 1, "procOpen", vspk__bstr(&a), on_line, ud, idfn, id_ud); free(a.p);
+}
+static void vspk_proc_send(VspkApp *app, int id, const char *line) {
+    VspkBuf a = {0}; vspk__bf(&a, "{\"id\":%d,\"line\":", id); vspk__bjs(&a, line); vspk__bc(&a, '}');
+    vspk_invoke(app, "procSend", vspk__bstr(&a), NULL, NULL); free(a.p);
+}
+static void vspk_proc_close(VspkApp *app, int id) { char a[48]; snprintf(a, sizeof a, "{\"id\":%d}", id); vspk_invoke(app, "procClose", a, NULL, NULL); }
+
+/* Puertos serie: fn recibe [{port,tipo,desc}]; scan=1 añade los BLE cercanos como "ble:<id>". */
+static void vspk_serial_list(VspkApp *app, int scan, VspkResultFn fn, void *ud) { vspk_invoke(app, "serialList", scan ? "{\"scan\":true}" : "{\"scan\":false}", fn, ud); }
+static void vspk_ble_scan(VspkApp *app, VspkResultFn fn, void *ud) { vspk_serial_list(app, 1, fn, ud); }
+/* Abre un puerto ("COM3", "/dev/ttyUSB0" o "ble:<id>"). on_line("data"|"err", línea) y on_line("close", ""). */
+static void vspk_serial_open(VspkApp *app, const char *port, int baud, VspkLineFn on_line, void *ud, VspkIdFn idfn, void *id_ud) {
+    VspkBuf a = {0}; vspk__bcat(&a, "{\"port\":"); vspk__bjs(&a, port); vspk__bf(&a, ",\"baud\":%d}", baud > 0 ? baud : 9600);
+    vspk__open_stream(app, 2, "serialOpen", vspk__bstr(&a), on_line, ud, idfn, id_ud); free(a.p);
+}
+static void vspk_serial_write(VspkApp *app, int id, const char *line, int nl) {
+    VspkBuf a = {0}; vspk__bf(&a, "{\"id\":%d,\"nl\":%s,\"line\":", id, nl ? "true" : "false"); vspk__bjs(&a, line); vspk__bc(&a, '}');
+    vspk_invoke(app, "serialWrite", vspk__bstr(&a), NULL, NULL); free(a.p);
+}
+static void vspk_serial_close(VspkApp *app, int id) { char a[48]; snprintf(a, sizeof a, "{\"id\":%d}", id); vspk_invoke(app, "serialClose", a, NULL, NULL); }
+
 /* Temporizadores (activos mientras vspk_run() esté en marcha). fn devuelve 0 para cancelar. */
 static void vspk__timer_add(VspkApp *app, int ms, int once, VspkTimerFn fn, void *ud) {
     VspkTimer t; memset(&t, 0, sizeof t); t.ms = ms; t.once = once; t.fn = fn; t.ud = ud;

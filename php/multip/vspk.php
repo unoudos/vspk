@@ -1066,6 +1066,114 @@ class App
     public function saveFile(string $title, callable $fn): static   { return $this->dialog('save', $title, $fn); }
     public function pickFolder(string $title, callable $fn): static { return $this->dialog('folder', $title, $fn); }
 
+    // ── API nativa de vspk.exe: sql, proc, serial/BLE, wifi, ping, ficheros, fetch, env ──────────
+    // Todas son asíncronas: $fn($resultado, $error = null). Si falla, $resultado es null y $error el mensaje
+    // (y se escribe también en STDERR).
+
+    private array $streams = [];
+    private bool $streamOn = false;
+
+    /** Evalúa en la página una expresión JS que devuelve una promesa y entrega su resultado a $fn. */
+    public function call(string $expr, ?callable $fn = null): static
+    {
+        $name = $this->ev('r' . (++$this->cbCount));
+        $this->events[$name] = function ($d) use ($fn) {
+            if (is_array($d) && ($d['ok'] ?? false)) {
+                if ($fn) $fn($d['r'] ?? null, null);
+                return;
+            }
+            $err = is_array($d) ? (string)($d['e'] ?? 'error') : 'sin respuesta';
+            fwrite(STDERR, "[vspk.php] error: {$err}\n");
+            if ($fn) $fn(null, $err);
+        };
+        $this->evalJs("Promise.resolve({$expr}).then(function(r){" . $this->postJs($name, 'JSON.stringify({ok:true,r:r})')
+            . "}).catch(function(e){" . $this->postJs($name, 'JSON.stringify({ok:false,e:String(e&&e.message||e)})') . "})");
+        return $this;
+    }
+
+    /** Cualquier comando de vspk.exe: __vspk.invoke($cmd, $args). */
+    public function invoke(string $cmd, array $args = [], ?callable $fn = null): static
+    {
+        return $this->call('__vspk.invoke(' . jsonJs($cmd) . ',' . ($args ? jsonJs($args) : '{}') . ')', $fn);
+    }
+
+    // SQLite — una sentencia por llamada. $params: [] o [1, 'a', null, true]
+    public function sqlOpen(string $name, ?callable $fn = null): static  { return $this->call('__vspk.sql.open(' . jsonJs($name) . ')', $fn); }
+    public function sqlExec(mixed $db, string $sql, array $params = [], ?callable $fn = null): static
+    { return $this->call('__vspk.sql.exec(' . jsonJs($db) . ',' . jsonJs($sql) . ',' . jsonJs(array_values($params)) . ')', $fn); }
+    public function sqlQuery(mixed $db, string $sql, array $params = [], ?callable $fn = null): static
+    { return $this->call('__vspk.sql.query(' . jsonJs($db) . ',' . jsonJs($sql) . ',' . jsonJs(array_values($params)) . ')', $fn); }
+    public function sqlClose(mixed $db, ?callable $fn = null): static    { return $this->call('__vspk.sql.close(' . jsonJs($db) . ')', $fn); }
+
+    // Ficheros, red y entorno
+    public function readFile(string $path, callable $fn): static                    { return $this->call('__vspk.readFile(' . jsonJs($path) . ",'utf8')", $fn); }
+    public function writeFile(string $path, string $data, ?callable $fn = null): static { return $this->call('__vspk.writeFile(' . jsonJs($path) . ',' . jsonJs($data) . ",'utf8')", $fn); }
+    public function fileExists(string $path, callable $fn): static                  { return $this->call('__vspk.exists(' . jsonJs($path) . ')', $fn); }
+    public function readDir(string $path, callable $fn): static                     { return $this->call('__vspk.readDir(' . jsonJs($path) . ')', $fn); }
+    /** $opts: ['method'=>'POST','headers'=>[...],'body'=>'...','timeout'=>15] */
+    public function httpFetch(string $url, callable $fn, array $opts = []): static  { return $this->call('__vspk.fetch(' . jsonJs($url) . ',' . ($opts ? jsonJs($opts) : '{}') . ')', $fn); }
+    public function env(callable $fn, string $key = ''): static                     { return $this->call('__vspk.env(' . ($key !== '' ? jsonJs($key) : '') . ')', $fn); }
+    public function clipboardRead(callable $fn): static                             { return $this->call('__vspk.clipboard.read()', $fn); }
+    public function ping(string $host, callable $fn, int $timeoutMs = 2000): static { return $this->call('__vspk.ping(' . jsonJs($host) . ',' . $timeoutMs . ')', $fn); }
+    public function wifiScan(callable $fn): static                                  { return $this->call('__vspk.wifiScan()', $fn); }
+
+    // Streams empujados por vspk.exe (proc y serial/BLE): window.postMessage → PHP
+    private function ensureStream(): void
+    {
+        if ($this->streamOn) return;
+        $this->streamOn = true;
+        $name = $this->ev('stream');
+        $this->events[$name] = function ($d) {
+            if (!is_array($d)) return;
+            $key = isset($d['__vspk_proc']) ? 'proc:' . $d['__vspk_proc'] : (isset($d['__vspk_serial']) ? 'serial:' . $d['__vspk_serial'] : null);
+            if ($key === null || !isset($this->streams[$key])) return;
+            $cb = $this->streams[$key];
+            if (in_array($d['k'] ?? '', ['exit', 'close'], true)) unset($this->streams[$key]);
+            try { $cb($d); } catch (\Throwable $e) { fwrite(STDERR, "[vspk.php] error en stream {$key}: {$e}\n"); }
+        };
+        $this->evalJs("if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;"
+            . "if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){" . $this->postJs($name, 'JSON.stringify(d)') . "}})}");
+    }
+
+    /**
+     * Lanza un ejecutable/script de la carpeta de la app (p. ej. 'assets/calc').
+     * $onLine($kind 'out'|'err', $línea) · $onExit($código) · $fn($id) recibe el id para procSend/procClose.
+     */
+    public function procOpen(string $path, callable $onLine, ?callable $onExit = null, ?callable $fn = null): static
+    {
+        $this->ensureStream();
+        return $this->invoke('procOpen', ['path' => $path], function ($pid, $err = null) use ($onLine, $onExit, $fn) {
+            if ($err !== null || $pid === null) return;
+            $this->streams['proc:' . $pid] = function (array $d) use ($onLine, $onExit) {
+                if (($d['k'] ?? '') === 'exit') { if ($onExit) $onExit($d['code'] ?? 0); }
+                else $onLine($d['k'] ?? 'out', $d['line'] ?? '');
+            };
+            if ($fn) $fn($pid);
+        });
+    }
+    public function procSend(int $id, string $line): static { return $this->invoke('procSend', ['id' => $id, 'line' => $line]); }
+    public function procClose(int $id): static              { return $this->invoke('procClose', ['id' => $id]); }
+
+    /** Puertos [['port','tipo','desc']]; $scan=true añade los BLE cercanos como 'ble:<id>'. */
+    public function serialList(callable $fn, bool $scan = false): static { return $this->invoke('serialList', ['scan' => $scan], $fn); }
+    public function bleScan(callable $fn): static                        { return $this->serialList($fn, true); }
+
+    /** Abre un puerto ('COM3', '/dev/ttyUSB0' o 'ble:<id>'). $onLine($kind 'data'|'err', $línea) · $onClose() · $fn($id). */
+    public function serialOpen(string $port, callable $onLine, int $baud = 9600, ?callable $onClose = null, ?callable $fn = null): static
+    {
+        $this->ensureStream();
+        return $this->invoke('serialOpen', ['port' => $port, 'baud' => $baud], function ($sid, $err = null) use ($onLine, $onClose, $fn) {
+            if ($err !== null || $sid === null) return;
+            $this->streams['serial:' . $sid] = function (array $d) use ($onLine, $onClose) {
+                if (($d['k'] ?? '') === 'close') { if ($onClose) $onClose(); }
+                else $onLine($d['k'] ?? 'data', $d['line'] ?? '');
+            };
+            if ($fn) $fn($sid);
+        });
+    }
+    public function serialWrite(int $id, string $line, bool $nl = true): static { return $this->invoke('serialWrite', ['id' => $id, 'line' => $line, 'nl' => $nl]); }
+    public function serialClose(int $id): static                                { return $this->invoke('serialClose', ['id' => $id]); }
+
     // ── Diálogos modales (mensaje / confirmación / pedir texto) ──────────────
 
     private function modal(string $call, callable $conv, ?callable $fn): static
