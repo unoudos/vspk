@@ -364,6 +364,15 @@ fn proc_open(path, on_line, on_exit, fn_id) {
 fn proc_send(pid, line) { invoke("procSend", {"id": pid, "line": line}, nil) }
 fn proc_close(pid)      { invoke("procClose", {"id": pid}, nil) }
 
+# ── Gestión de la ventana principal (vspk.exe ≥ con winMove/winResize/winSnap/winFocus) ──────────────────
+#   win_move(100, 50) · win_resize(800, 600) · win_snap("left"|"right"|"top"|"bottom"|"topleft"|"topright"|
+#   "bottomleft"|"bottomright"|"center"|"maximize"|"restore") · win_focus()
+#   Posiciones y tamaños en píxeles físicos. Si el vspk.exe es antiguo, se avisa por on_error / consola.
+fn win_move(x, y)     { invoke("winMove", {"x": x, "y": y}, nil) }
+fn win_resize(w, h)   { invoke("winResize", {"w": w, "h": h}, nil) }
+fn win_snap(pos)      { invoke("winSnap", {"pos": pos}, nil) }
+fn win_focus()        { invoke("winFocus", {}, nil) }
+
 # serial_list(fn(puertos) {...}, false)  → [{port, tipo, desc}] · scan=true añade los BLE cercanos como "ble:<id>"
 fn serial_list(fn_cb, scan) { invoke("serialList", {"scan": scan}, fn_cb) }
 fn ble_scan(fn_cb)          { serial_list(fn_cb, true) }
