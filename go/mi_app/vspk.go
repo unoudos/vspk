@@ -16,6 +16,9 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -414,6 +417,14 @@ type App struct {
 	stop      chan struct{}
 
 	wins []*Win
+
+	// IPC con vspk: id de la ventana principal (se resuelve la primera vez que se necesita)
+	idMu         sync.Mutex
+	openMu       sync.Mutex // serializa winOpen: cada ventana calcula su id sin pisar a otra
+	mainHtv      string
+	mainBefore   map[int]bool
+	mainID       int
+	mainResolved bool
 }
 
 func New(title string, width, height int, opts ...string) *App {
@@ -584,7 +595,7 @@ func (a *App) buildPage(title string, widgets []Widget, win string, isMain bool,
       var key = el.getAttribute('data-spork-text').replace('window.__state.', '');
       if (key === k) el.textContent = String(v == null ? '' : v);
     });
-    document.querySelectorAll('[data-spork-bind="' + k + '"]').forEach(function(el) {
+    document.querySelectorAll('[data-spork-bind="' + CSS.escape(k) + '"]').forEach(function(el) {
       if (el.type === 'checkbox') el.checked = !!v; else el.value = (v == null ? '' : v);
     });
     document.querySelectorAll('[data-spork-style]').forEach(function(el) {
@@ -599,10 +610,21 @@ func (a *App) buildPage(title string, widgets []Widget, win string, isMain bool,
         try { el.style.display = Function('return !!('+expr+')')() ? '' : 'none'; } catch(e) {}
       }
     });
+    document.querySelectorAll('[data-spork-attrs]').forEach(function(el) {
+      try {
+        var at = JSON.parse(el.getAttribute('data-spork-attrs'));
+        for (var an in at) {
+          if (String(at[an]).indexOf('window.__state.' + k) !== -1) {
+            var av = Function('return (' + at[an] + ')')();
+            if (av == null || av === false) el.removeAttribute(an); else el.setAttribute(an, String(av));
+          }
+        }
+      } catch(e) {}
+    });
   };
   // Envía a Go el valor que el usuario escribe/elige, para que State.Get() lo vea.
   window.__sync = function(k, v) {
-    try { fetch('http://127.0.0.1:%d/event/%s', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: k, v: v, w: window.__win})}); } catch(_) {}
+    try { fetch('http://127.0.0.1:%d/event/%s', {method: 'POST', mode: 'no-cors', keepalive: true, headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: k, v: v, w: window.__win})}); } catch(_) {}
   };
   %s
   document.querySelectorAll('[data-spork-style]').forEach(function(el) {
@@ -660,6 +682,8 @@ func (a *App) startServer(html string) (int, *http.Server) {
 		for {
 			select {
 			case <-ctx.Done():
+				return
+			case <-a.stop:
 				return
 			case msg := <-ch:
 				fmt.Fprint(w, msg)
@@ -725,7 +749,7 @@ func (a *App) startServer(html string) (int, *http.Server) {
 		name := strings.TrimPrefix(r.URL.Path, "/event/")
 		if name == a.ev("v") && r.Method == http.MethodPost {
 			// valor de un widget enlazado: {"n": nombre, "v": valor} -> State (sin reenviar a la página)
-			body, _ := io.ReadAll(r.Body)
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 			var msg struct {
 				N string `json:"n"`
 				V any    `json:"v"`
@@ -749,7 +773,7 @@ func (a *App) startServer(html string) (int, *http.Server) {
 		}
 		var payload string
 		if r.Method == http.MethodPost {
-			body, err := io.ReadAll(r.Body)
+			body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 			if err == nil {
 				payload = string(body)
 			}
@@ -829,7 +853,14 @@ func (a *App) Run() {
 
 	html := a.buildHTML()
 	_, srv := a.startServer(html)
-	defer srv.Close()
+	defer func() {
+		// cierre ordenado: deja terminar las peticiones en curso (máx. 500 ms) y fuerza el resto
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if srv.Shutdown(ctx) != nil {
+			srv.Close()
+		}
+	}()
 
 	// .htv: cabecera + línea en blanco + HTML. vspk.exe sirve spork.css/js y inyecta window.__vspk.
 	htv := filepath.Join(os.TempDir(), fmt.Sprintf("vspk_%d_%s.htv", os.Getpid(), a.token[:6]))
@@ -845,6 +876,10 @@ func (a *App) Run() {
 		return
 	}
 	defer os.Remove(htv)
+
+	a.idMu.Lock()
+	a.mainHtv, a.mainBefore, a.mainID, a.mainResolved = htv, winIDs(), 0, false
+	a.idMu.Unlock()
 
 	vlogf("lanzando: %s %s\n", a.vspkExe, htv)
 	cmd := exec.Command(a.vspkExe, htv)
@@ -1254,6 +1289,12 @@ func (a *App) cv(id, op string, args ...any) {
 		a.cvLogs[id] = ""
 	}
 	a.cvLogs[id] += js + ";"
+	// Tope: el log se reenvía entero al cargar/reconectar; descarta lo más antiguo en límite de sentencia.
+	if len(a.cvLogs[id]) > 1000000 {
+		if cut := strings.Index(a.cvLogs[id][500000:], ";__cv("); cut >= 0 {
+			a.cvLogs[id] = a.cvLogs[id][500000+cut+1:]
+		}
+	}
 	run := a.running
 	a.mu.Unlock()
 	if run {
@@ -1321,7 +1362,7 @@ func MenuItem(label, js string, shortcut ...string) Widget {
 	if sc != "" {
 		kbd = "<kbd>" + htmlEscape(sc) + "</kbd>"
 	}
-	return Raw(`<button type="button" class="sz-menu-item" onclick="` + strings.ReplaceAll(js, `"`, "&quot;") +
+	return Raw(`<button type="button" class="sz-menu-item" onclick="` + htmlEscape(js) +
 		`" data-accel="` + htmlEscape(sc) + `"><span>` + htmlEscape(label) + `</span>` + kbd + `</button>`)
 }
 
@@ -1367,6 +1408,11 @@ type Win struct {
 	cmd  *exec.Cmd
 	htv  string
 	open bool
+
+	// IPC con vspk
+	before     map[int]bool
+	winID      int
+	idResolved bool
 }
 
 func (a *App) NewWindow(title string, width, height int) *Win {
@@ -1381,6 +1427,25 @@ func (w *Win) Add(widgets ...Widget) *Win { w.widgets = append(w.widgets, widget
 func (w *Win) Close()                     { w.app.evalTo(w.id, "__vspk.close()") }
 func (w *Win) SetTitle(t string)          { w.app.evalTo(w.id, "__vspk.setTitle("+jsonStr(t)+")") }
 func (w *Win) EvalJS(js string)           { w.app.evalTo(w.id, js) }
+
+// Gestión por IPC con vspk; devuelven false si no hay pipe o la ventana aún no está registrada.
+func (w *Win) Focus() bool           { return w.ipc("focus", nil) }
+func (w *Win) Move(x, y int) bool    { return w.ipc("move", map[string]any{"x": x, "y": y}) }
+func (w *Win) Resize(wd, h int) bool { return w.ipc("resize", map[string]any{"w": wd, "h": h}) }
+func (w *Win) Snap(pos string) bool  { return w.ipc("snap", map[string]any{"pos": pos}) }
+
+func (w *Win) ipc(cmd string, extra map[string]any) bool {
+	w.mu.Lock()
+	if !w.idResolved {
+		if w.cmd != nil && w.htv != "" {
+			w.winID = resolveWinID(w.before, w.htv, 2*time.Second)
+		}
+		w.idResolved = true
+	}
+	id := w.winID
+	w.mu.Unlock()
+	return winCmd(id, cmd, extra)
+}
 
 func (w *Win) IsOpen() bool {
 	w.mu.Lock()
@@ -1417,6 +1482,8 @@ func (w *Win) OnClose(fn func() bool) {
 }
 
 func (a *App) winOpen(w *Win) {
+	a.openMu.Lock()
+	defer a.openMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.open {
@@ -1440,6 +1507,8 @@ func (a *App) winOpen(w *Win) {
 		vlogf("no se pudo escribir %s: %v\n", w.htv, err)
 		return
 	}
+	a.mainWinID() // que la principal ya tenga su id: así la ventana nueva es la única "nueva"
+	w.before, w.winID, w.idResolved = winIDs(), 0, false
 	cmd := exec.Command(a.vspkExe, w.htv)
 	cmd.Stdout = os.Stdout
 	if f := vlogFile(); f != nil {
@@ -1458,6 +1527,152 @@ func (a *App) winOpen(w *Win) {
 		w.mu.Unlock()
 	}()
 }
+
+// ── Gestión de ventanas por IPC con vspk ─────────────────────────────────────
+//
+//	app.Move(100, 50); app.Resize(800, 600); app.Snap("left"); app.Focus()
+//	aj.Snap("right")   // también en las ventanas de app.NewWindow(...)
+//
+// vspk asigna el id de ventana al abrirla; se averigua comparando `list` antes y después de lanzar.
+// Todos devuelven false si vspk no expone el pipe o la ventana aún no está registrada.
+
+const (
+	ipcPipeWindows = `\\.\pipe\vspk`
+	ipcSockUnix    = "/tmp/vspk.sock"
+)
+
+// ipcSend envía un comando al pipe/socket de vspk y devuelve la respuesta (nil si falla o pasa de 2 s).
+func ipcSend(msg map[string]any) map[string]any {
+	line, err := json.Marshal(msg)
+	if err != nil {
+		return nil
+	}
+	line = append(line, '\n')
+	ch := make(chan map[string]any, 1)
+	go func() {
+		var rw io.ReadWriteCloser
+		var err error
+		if runtime.GOOS == "windows" {
+			rw, err = os.OpenFile(ipcPipeWindows, os.O_RDWR, 0)
+		} else {
+			rw, err = net.Dial("unix", ipcSockUnix)
+		}
+		if err != nil {
+			ch <- nil
+			return
+		}
+		defer rw.Close()
+		if _, err = rw.Write(line); err != nil {
+			ch <- nil
+			return
+		}
+		resp, err := bufio.NewReader(rw).ReadBytes('\n')
+		if err != nil && len(resp) == 0 {
+			ch <- nil
+			return
+		}
+		var out map[string]any
+		if json.Unmarshal(bytes.TrimSpace(resp), &out) != nil {
+			ch <- nil
+			return
+		}
+		ch <- out
+	}()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(2 * time.Second):
+		return nil
+	}
+}
+
+func listWindows() []map[string]any {
+	r := ipcSend(map[string]any{"cmd": "list"})
+	if r == nil {
+		return nil // sin pipe / timeout
+	}
+	arr, _ := r["windows"].([]any)
+	out := make([]map[string]any, 0, len(arr))
+	for _, x := range arr {
+		if m, ok := x.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func winIDs() map[int]bool {
+	ids := map[int]bool{} // sin pipe → vacío
+	for _, w := range listWindows() {
+		if f, ok := w["id"].(float64); ok {
+			ids[int(f)] = true
+		}
+	}
+	return ids
+}
+
+// resolveWinID espera (≤ timeout) a que aparezca en `list` una ventana que no estaba en before.
+func resolveWinID(before map[int]bool, htv string, timeout time.Duration) int {
+	base := filepath.Base(htv)
+	end := time.Now().Add(timeout)
+	for {
+		best := 0
+		for _, w := range listWindows() {
+			f, ok := w["id"].(float64)
+			if !ok || before[int(f)] {
+				continue
+			}
+			// Si vspk informa del fichero, coincidencia exacta; si no, la nueva con mayor id.
+			if file, ok := w["file"].(string); ok && strings.HasSuffix(file, base) {
+				return int(f)
+			}
+			if int(f) > best {
+				best = int(f)
+			}
+		}
+		if best != 0 {
+			return best
+		}
+		if time.Now().After(end) {
+			return 0
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func winCmd(id int, cmd string, extra map[string]any) bool {
+	if id == 0 {
+		return false
+	}
+	m := map[string]any{"cmd": cmd, "id": id}
+	for k, v := range extra {
+		m[k] = v
+	}
+	ok, _ := ipcSend(m)["ok"].(bool)
+	return ok
+}
+
+func (a *App) mainWinID() int {
+	a.idMu.Lock()
+	defer a.idMu.Unlock()
+	if !a.mainResolved {
+		if a.mainHtv != "" {
+			a.mainID = resolveWinID(a.mainBefore, a.mainHtv, 2*time.Second)
+		}
+		a.mainResolved = true
+	}
+	return a.mainID
+}
+
+func (a *App) Focus() bool { return winCmd(a.mainWinID(), "focus", nil) }
+func (a *App) Move(x, y int) bool {
+	return winCmd(a.mainWinID(), "move", map[string]any{"x": x, "y": y})
+}
+func (a *App) Resize(w, h int) bool {
+	return winCmd(a.mainWinID(), "resize", map[string]any{"w": w, "h": h})
+}
+func (a *App) Snap(pos string) bool          { return winCmd(a.mainWinID(), "snap", map[string]any{"pos": pos}) }
+func (a *App) ListWindows() []map[string]any { return listWindows() }
 
 // findIcon busca icon.ico/icon.png/favicon.* junto al ejecutable o en el directorio actual.
 func findIcon() string {
@@ -1613,9 +1828,9 @@ func (a *App) ensureStream() {
 		}
 		key := ""
 		if v, ok := m["__vspk_proc"].(float64); ok {
-			key = fmt.Sprintf("proc:%d", int(v))
+			key = fmt.Sprintf("%s:proc:%d", a.token, int(v))
 		} else if v, ok := m["__vspk_serial"].(float64); ok {
-			key = fmt.Sprintf("serial:%d", int(v))
+			key = fmt.Sprintf("%s:serial:%d", a.token, int(v))
 		} else {
 			return
 		}
@@ -1651,7 +1866,7 @@ func (a *App) openStream(prefix, cmd string, args map[string]any, onLine func(ki
 		f, _ := r.(float64)
 		id := int(f)
 		vspkStreamMu.Lock()
-		vspkStreams[fmt.Sprintf("%s:%d", prefix, id)] = onLine
+		vspkStreams[fmt.Sprintf("%s:%s:%d", a.token, prefix, id)] = onLine
 		vspkStreamMu.Unlock()
 		if fn != nil {
 			fn(id, nil)

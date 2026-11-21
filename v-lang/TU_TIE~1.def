@@ -1,5 +1,0 @@
-LIBRARY TU_TIE~1.EXE
-
-EXPORTS
-__bt_init
-tcc_backtrace

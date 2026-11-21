@@ -1,4 +1,4 @@
-#@py
+
 # demo.spk — prueba de widgets de vspk (cambia #@py por #@rs / #@kt / #@js para probar cada target)
 
 import "vspk.spk"

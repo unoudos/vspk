@@ -8,3 +8,6 @@ node_modules/
 target/
 __pycache__/
 *.log
+
+*.bak_pre_*
+_to_delete/

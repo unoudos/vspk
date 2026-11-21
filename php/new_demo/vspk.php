@@ -801,7 +801,7 @@ class RawHtml extends Widget
 
 function MenuItem(string $label, string $js = '', string $shortcut = ''): Widget
 {
-    $click = str_replace('"', '&quot;', $js);
+    $click = h($js);   // escapar también & < > ' (no solo las comillas dobles)
     $kbd = $shortcut !== '' ? '<kbd>' . h($shortcut) . '</kbd>' : '';
     return new RawHtml('<button type="button" class="sz-menu-item" onclick="' . $click . '" data-accel="' . h($shortcut) . '"><span>' . h($label) . '</span>' . $kbd . '</button>');
 }
@@ -863,20 +863,23 @@ class Window
     }
 
     // Comandos via IPC (gestión entre ventanas)
-    public function move(int $x, int $y, int $id = 1): void   { $this->ipc(['cmd' => 'move', 'id' => $id, 'x' => $x, 'y' => $y]); }
-    public function resize(int $w, int $h, int $id = 1): void { $this->ipc(['cmd' => 'resize', 'id' => $id, 'w' => $w, 'h' => $h]); }
-    public function focus(int $id = 1): void                  { $this->ipc(['cmd' => 'focus', 'id' => $id]); }
-    public function snap(string $pos, int $id = 1): void      { $this->ipc(['cmd' => 'snap', 'id' => $id, 'pos' => $pos]); }
+    // $id = null → la ventana principal de esta App (se averigua por IPC); si no se pudo, 1.
+    public function move(int $x, int $y, ?int $id = null): void   { $this->ipc(['cmd' => 'move', 'id' => $id ?? $this->app->mainWinId() ?: 1, 'x' => $x, 'y' => $y]); }
+    public function resize(int $w, int $h, ?int $id = null): void { $this->ipc(['cmd' => 'resize', 'id' => $id ?? $this->app->mainWinId() ?: 1, 'w' => $w, 'h' => $h]); }
+    public function focus(?int $id = null): void                  { $this->ipc(['cmd' => 'focus', 'id' => $id ?? $this->app->mainWinId() ?: 1]); }
+    public function snap(string $pos, ?int $id = null): void      { $this->ipc(['cmd' => 'snap', 'id' => $id ?? $this->app->mainWinId() ?: 1, 'pos' => $pos]); }
     public function listWindows(): array                      { return $this->ipc(['cmd' => 'list'])['windows'] ?? []; }
     public function broadcast(mixed $payload): void           { $this->ipc(['cmd' => 'broadcast', 'payload' => $payload]); }
 
-    private function ipc(array $msg): array
+    /** @internal */
+    public function ipc(array $msg): array
     {
         try {
             $sock = PHP_OS_FAMILY === 'Windows'
                 ? @fopen('\\\\.\\pipe\\vspk', 'r+b')
                 : @fsockopen('unix:///tmp/vspk.sock', -1, $errno, $errstr, 1.0);
             if (!$sock) return ['ok' => false, 'error' => 'No se pudo conectar al IPC'];
+            @stream_set_timeout($sock, 2);
             fwrite($sock, json_encode($msg) . "\n");
             $line = fgets($sock, 4096);
             fclose($sock);
@@ -903,6 +906,10 @@ final class ChildWindow
     public bool $want = false;
     public bool $closeOn = false;
     public string $closeJs = '';
+    /** @internal id de ventana de vspk (IPC): -1 = sin resolver, 0 = no disponible */
+    public int $winId = -1;
+    /** @internal ids de ventanas existentes antes de lanzar ésta */
+    public array $before = [];
 
     public function __construct(private App $app, public string $title, public int $w, public int $h, string $id)
     {
@@ -915,6 +922,11 @@ final class ChildWindow
     public function setTitle(string $t): void { $this->app->winEval($this, '__vspk.setTitle(' . jsonJs($t) . ')'); }
     public function evalJs(string $js): void  { $this->app->winEval($this, $js); }
     public function onClose(callable $fn): static { $this->app->winOnClose($this, $fn); return $this; }
+    // Gestión por IPC con vspk; false si no hay pipe o la ventana aún no está registrada.
+    public function move(int $x, int $y): bool    { return $this->app->winCmd(['cmd' => 'move', 'x' => $x, 'y' => $y], $this); }
+    public function resize(int $w, int $h): bool  { return $this->app->winCmd(['cmd' => 'resize', 'w' => $w, 'h' => $h], $this); }
+    public function snap(string $pos): bool       { return $this->app->winCmd(['cmd' => 'snap', 'pos' => $pos], $this); }
+    public function focus(): bool                 { return $this->app->winCmd(['cmd' => 'focus'], $this); }
     public function isOpen(): bool
     {
         if (!is_resource($this->proc)) return false;
@@ -1284,6 +1296,11 @@ class App
         $js = '__cv(' . jsonJs($id) . ',' . jsonJs($op) . ',' . jsonJs($args) . ')';
         if ($op === 'clear') $this->cvLogs[$id] = '';
         $this->cvLogs[$id] = ($this->cvLogs[$id] ?? '') . $js . ';';
+        // Tope: el log se reenvía entero al cargar/reconectar; descarta lo más antiguo en límite de sentencia.
+        if (strlen($this->cvLogs[$id]) > 1000000) {
+            $cut = strpos($this->cvLogs[$id], ';__cv(', 500000);
+            if ($cut !== false) $this->cvLogs[$id] = substr($this->cvLogs[$id], $cut + 1);
+        }
         if ($this->running) $this->bridge->push('all', $js);
     }
 
@@ -1302,6 +1319,61 @@ class App
     public function window(): Window
     {
         return new Window($this);
+    }
+
+    // ── Gestión de la ventana principal por IPC con vspk ─────────────────────────
+    //   $app->move(100, 50);  $app->resize(800, 600);  $app->snap('left');  $app->focus();
+    //   Devuelven bool: false si vspk no expone el pipe o la ventana aún no está registrada.
+    public function move(int $x, int $y): bool   { return $this->winCmd(['cmd' => 'move', 'x' => $x, 'y' => $y], null); }
+    public function resize(int $w, int $h): bool { return $this->winCmd(['cmd' => 'resize', 'w' => $w, 'h' => $h], null); }
+    public function snap(string $pos): bool      { return $this->winCmd(['cmd' => 'snap', 'pos' => $pos], null); }
+    public function focus(): bool                { return $this->winCmd(['cmd' => 'focus'], null); }
+
+    private int    $mainWinId  = -1;   // -1 = sin resolver, 0 = no disponible
+    private array  $mainBefore = [];
+    private string $mainHtv    = '';
+
+    /** @return list<int> */
+    private function winIds(): array
+    {
+        return array_map(fn($w) => (int)($w['id'] ?? 0), (new Window($this))->listWindows());
+    }
+
+    /** Espera (≤ $timeout s) a que aparezca en `list` una ventana que no estaba en $before. */
+    private function resolveWinId(array $before, string $htv, float $timeout = 2.0): int
+    {
+        $base = basename($htv);
+        $end  = microtime(true) + $timeout;
+        do {
+            $fresh = array_values(array_filter((new Window($this))->listWindows(), fn($w) => !in_array((int)($w['id'] ?? 0), $before, true)));
+            if ($fresh) {
+                // Si vspk informa del fichero, coincidencia exacta; si no, la nueva con mayor id.
+                foreach ($fresh as $w) if (isset($w['file']) && is_string($w['file']) && str_ends_with($w['file'], $base)) return (int)$w['id'];
+                return max(array_map(fn($w) => (int)$w['id'], $fresh));
+            }
+            usleep(50000);
+        } while (microtime(true) < $end);
+        return 0;
+    }
+
+    /** @internal */
+    public function mainWinId(): int
+    {
+        if ($this->mainWinId < 0) $this->mainWinId = $this->mainHtv === '' ? 0 : $this->resolveWinId($this->mainBefore, $this->mainHtv);
+        return $this->mainWinId;
+    }
+
+    /** @internal */
+    public function winCmd(array $msg, ?ChildWindow $w): bool
+    {
+        if ($w === null) {
+            $id = $this->mainWinId();
+        } else {
+            if ($w->winId < 0) $w->winId = (is_resource($w->proc) && $w->htv !== '') ? $this->resolveWinId($w->before, $w->htv) : 0;
+            $id = $w->winId;
+        }
+        if ($id <= 0) return false;
+        return (bool)((new Window($this))->ipc($msg + ['id' => $id])['ok'] ?? false);
     }
 
     /** Ventana adicional. Comparte states, canvas y puente con la principal. */
@@ -1346,6 +1418,9 @@ class App
         file_put_contents($w->htv, "title: {$w->title}\nwidth: {$w->w}\nheight: {$w->h}\ndevtools: true\n"
             . (($ic = $this->findIcon()) !== '' ? "icon: {$ic}\n" : '')
             . ($w->closeOn ? "on_close: confirm\n" : '') . "\n" . $page);
+        $this->mainWinId();   // que la principal ya tenga su id: así la ventana nueva es la única "nueva"
+        $w->before = $this->winIds();
+        $w->winId = -1;
         $proc = @proc_open([findVspk(), $w->htv], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
         $w->proc = is_resource($proc) ? $proc : null;
     }
@@ -1374,8 +1449,8 @@ window.__state = %STATE%;
 window.__win = %WIN%;
 window.__set = function(name, value) {
   window.__state[name] = value;
-  document.querySelectorAll('[data-spork-text="' + name + '"]').forEach(function(el) { el.textContent = value; });
-  document.querySelectorAll('[data-spork-bind="' + name + '"]').forEach(function(el) {
+  document.querySelectorAll('[data-spork-text="' + CSS.escape(name) + '"]').forEach(function(el) { el.textContent = value; });
+  document.querySelectorAll('[data-spork-bind="' + CSS.escape(name) + '"]').forEach(function(el) {
     if (el.type === 'checkbox') el.checked = !!value;
     else if (el.value != value) el.value = value;
   });
@@ -1386,7 +1461,7 @@ window.__set = function(name, value) {
 };
 // Valor que el usuario escribe/elige → a PHP (State::get() lo ve) y a los demás widgets enlazados.
 window.__sync = function(n, v) {
-  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}
+  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', keepalive: true, headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}
 };
 (function() {
   function onUser(e) {
@@ -1544,6 +1619,7 @@ HTML;
             . "\n" . $html
         );
 
+        $this->mainHtv = $htv; $this->mainWinId = -1; $this->mainBefore = $this->winIds();
         $proc = @proc_open([$exe, $htv], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
         if (!is_resource($proc)) {
             @unlink($htv);
@@ -1577,6 +1653,9 @@ HTML;
                 if ($w->htv !== '') @unlink($w->htv);
             }
             $this->bridge->close();
+            // Si salimos por una excepción la ventana sigue viva: sin esto, proc_close() se quedaría esperando a que el usuario la cierre.
+            $st = @proc_get_status($proc);
+            if (is_array($st) && !empty($st['running'])) @proc_terminate($proc);
             $code = proc_close($proc);
             if ($exit === -1) $exit = $code;
             @unlink($htv);

@@ -33,6 +33,7 @@ import queue
 import secrets
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -118,6 +119,42 @@ def _ipc_send(msg: dict) -> Optional[dict]:
     except Exception:
         return None
 
+
+# ── Gestión de ventanas por IPC (App / ChildWindow) ─────────────────────────
+# vspk asigna el id de ventana al abrirla; se averigua comparando `list` antes y después de lanzar.
+
+_ipc_start_lock = threading.Lock()   # arranque del hilo de escucha IPC (App y Window)
+
+
+def _win_ids() -> set:
+    r = _ipc_send({"cmd": "list"})
+    return {w.get("id") for w in (r or {}).get("windows", [])}   # sin pipe → vacío
+
+
+def _resolve_win_id(before: set, htv: str, timeout: float = 2.0) -> int:
+    base = os.path.basename(htv)
+    end = time.monotonic() + timeout
+    while True:
+        r = _ipc_send({"cmd": "list"})
+        fresh = [w for w in (r or {}).get("windows", []) if w.get("id") not in before]
+        if fresh:
+            # Si vspk informa del fichero, coincidencia exacta; si no, la nueva con mayor id.
+            for w in fresh:
+                if isinstance(w.get("id"), int) and isinstance(w.get("file"), str) and w["file"].endswith(base):
+                    return int(w["id"])
+            ids = [w["id"] for w in fresh if isinstance(w.get("id"), int)]
+            return int(max(ids)) if ids else 0
+        if time.monotonic() >= end:
+            return 0
+        time.sleep(0.05)
+
+
+def _win_cmd(win_id: int, cmd: str, **extra) -> bool:
+    if not win_id:
+        return False
+    r = _ipc_send({"cmd": cmd, "id": win_id, **extra})
+    return bool(r and r.get("ok"))
+
 # ── Utilidades ────────────────────────────────────────────────────────────────
 
 def _h(s: Any) -> str:
@@ -132,14 +169,44 @@ _CURRENT_APP: Optional["App"] = None   # la última App creada (los widgets la u
 # ── Estado reactivo ───────────────────────────────────────────────────────────
 
 class _JsExpr:
-    """Expresión JS con soporte aritmético para compilar lambdas (js=lambda: ...)."""
+    """
+    Expresión JS para compilar lambdas (js=lambda: ...). Operadores soportados:
+        aritméticos  + - * / % //  (y sus versiones por la derecha), -x
+        comparación  == != < <= > >=
+        lógicos      &  |  ~   (en lugar de and / or / not, que Python no deja sobrecargar)
+    NO se puede: if/else, ternarios, and/or/not, llamadas a métodos ni funciones. Para eso usa js="código JS"
+    o state.js_inc()/inc()/dec(). Si la lambda usa algo no soportado, se avisa por stderr y el botón queda sin acción.
+    """
     def __init__(self, js: str): self._js = js
     def _o(self, o): return o._js if isinstance(o, _JsExpr) else json.dumps(o)
-    def __add__(self, o): return _JsExpr(f"({self._js}+{self._o(o)})")
-    def __sub__(self, o): return _JsExpr(f"({self._js}-{self._o(o)})")
-    def __mul__(self, o): return _JsExpr(f"({self._js}*{self._o(o)})")
-    def __radd__(self, o): return _JsExpr(f"({json.dumps(o)}+{self._js})")
-    def __rsub__(self, o): return _JsExpr(f"({json.dumps(o)}-{self._js})")
+    def _bin(self, op, o, rev=False):
+        a, b = self._js, self._o(o)
+        return _JsExpr(f"({b}{op}{a})" if rev else f"({a}{op}{b})")
+    def __add__(self, o): return self._bin("+", o)
+    def __sub__(self, o): return self._bin("-", o)
+    def __mul__(self, o): return self._bin("*", o)
+    def __truediv__(self, o): return self._bin("/", o)
+    def __mod__(self, o): return self._bin("%", o)
+    def __floordiv__(self, o): return _JsExpr(f"Math.floor({self._js}/{self._o(o)})")
+    def __rfloordiv__(self, o): return _JsExpr(f"Math.floor({json.dumps(o)}/{self._js})")
+    def __radd__(self, o): return self._bin("+", o, True)
+    def __rsub__(self, o): return self._bin("-", o, True)
+    def __rmul__(self, o): return self._bin("*", o, True)
+    def __rtruediv__(self, o): return self._bin("/", o, True)
+    def __rmod__(self, o): return self._bin("%", o, True)
+    def __neg__(self): return _JsExpr(f"(-{self._js})")
+    def __eq__(self, o): return self._bin("===", o)
+    def __ne__(self, o): return self._bin("!==", o)
+    def __lt__(self, o): return self._bin("<", o)
+    def __le__(self, o): return self._bin("<=", o)
+    def __gt__(self, o): return self._bin(">", o)
+    def __ge__(self, o): return self._bin(">=", o)
+    def __and__(self, o): return self._bin("&&", o)
+    def __or__(self, o): return self._bin("||", o)
+    def __invert__(self): return _JsExpr(f"(!{self._js})")
+    __hash__ = object.__hash__
+    def __bool__(self):
+        raise TypeError("una expresión JS no se puede usar en if/and/or/not: usa &, |, ~ o js=\"código JS\"")
     def __repr__(self): return self._js
 
 class _JsState:
@@ -235,7 +302,8 @@ def _compile_callback(fn: Callable) -> str:
             new_fn = types.FunctionType(fn.__code__, fake_globals, fn.__name__, fn.__defaults__)
         result = new_fn()
         return result if isinstance(result, str) and result else ""
-    except Exception:
+    except Exception as e:
+        print(f"[vspk] lambda no compilable a JS ({e}); usa js=\"código JS\" para expresiones complejas", file=sys.stderr)
         return ""
 
 def _to_js_expr(val: Any) -> str:
@@ -756,7 +824,7 @@ _MENU_A = '<style>.sz-menubar{position:fixed;top:0;left:0;right:0;z-index:1000;d
 _MENU_B = '</div><div class="sz-menubar-space"></div><script>(function(){if(window.__menu)return;window.__menu=1;var bar=document.querySelector(\'.sz-menubar\');function menus(){return bar.querySelectorAll(\':scope > .sz-menu\')}window.__vspk_menu_click=function(id){var p=id.split(\'.\');var m=menus()[+p[0]];if(m)m.querySelector(\'.sz-menu-list\').children[+p[1]].click()};window.__vspk_menu_ok=function(){document.documentElement.classList.add(\'sz-native\')};if(bar&&window.ipc&&window.__vspk_native_menu_ok){var ms=[];Array.prototype.forEach.call(menus(),function(m,mi){var items=[];Array.prototype.forEach.call(m.querySelector(\'.sz-menu-list\').children,function(c,ii){if(c.classList.contains(\'sz-menu-sep\'))items.push({sep:true});else items.push({id:mi+\'.\'+ii,label:(c.querySelector(\'span\')||c).textContent,accel:c.getAttribute(\'data-accel\')||\'\'})});ms.push({label:m.querySelector(\'.sz-menu-title\').textContent,items:items})});window.ipc.postMessage(JSON.stringify({cmd:\'setMenu\',menu:ms}))}function closeAll(except){document.querySelectorAll(\'.sz-menu.sz-open\').forEach(function(m){if(m!==except)m.classList.remove(\'sz-open\')})}document.addEventListener(\'click\',function(e){var t=e.target.closest?e.target.closest(\'.sz-menu-title\'):null;closeAll(t?t.parentNode:null);if(t)t.parentNode.classList.toggle(\'sz-open\');var it=e.target.closest?e.target.closest(\'.sz-menu-item\'):null;if(it)closeAll(null)});document.addEventListener(\'mouseover\',function(e){var t=e.target.closest?e.target.closest(\'.sz-menu-title\'):null;var o=document.querySelector(\'.sz-menu.sz-open\');if(t&&o&&o!==t.parentNode){closeAll(t.parentNode);t.parentNode.classList.add(\'sz-open\')}});document.addEventListener(\'keydown\',function(e){if(e.key===\'Escape\'){closeAll(null);return}if(document.documentElement.classList.contains(\'sz-native\')&&!/Win/.test(navigator.platform))return;var k=(e.ctrlKey?\'ctrl+\':\'\')+(e.shiftKey?\'shift+\':\'\')+(e.altKey?\'alt+\':\'\')+e.key.toLowerCase();var items=document.querySelectorAll(\'.sz-menu-item[data-accel]\');for(var i=0;i<items.length;i++){var a=items[i].getAttribute(\'data-accel\');if(a&&a.toLowerCase()===k){e.preventDefault();items[i].click();return}}})})();</script>'
 
 def MenuItem(label: str, js: str = "", shortcut: str = "") -> Widget:
-    click = js.replace('"', "&quot;")
+    click = _h(js)   # escapar también & < > ' (no solo las comillas dobles)
     kbd = f"<kbd>{_h(shortcut)}</kbd>" if shortcut else ""
     return Raw(f'<button type="button" class="sz-menu-item" onclick="{click}" data-accel="{_h(shortcut)}"><span>{_h(label)}</span>{kbd}</button>')
 
@@ -864,6 +932,8 @@ class ChildWindow:
         self.want = False
         self.close_on = False
         self.close_js = ""
+        self.win_id = -1          # id de ventana de vspk (IPC): -1 = sin resolver, 0 = no disponible
+        self.before: set = set()  # ids existentes antes de lanzar ésta
 
     def add(self, *widgets) -> "ChildWindow":
         self.widgets.extend(widgets); return self
@@ -879,10 +949,15 @@ class ChildWindow:
         self._app._win_on_close(self, fn); return self
     def is_open(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+    # Gestión por IPC con vspk; devuelven False si no hay pipe o la ventana aún no está registrada.
+    def focus(self) -> bool:             return self._app._win_cmd(self, "focus")
+    def move(self, x: int, y: int) -> bool:   return self._app._win_cmd(self, "move", x=x, y=y)
+    def resize(self, w: int, h: int) -> bool: return self._app._win_cmd(self, "resize", w=w, h=h)
+    def snap(self, pos: str) -> bool:    return self._app._win_cmd(self, "snap", pos=pos)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-_PAGE_JS = 'window.__state = %STATE%;\nwindow.__win = %WIN%;\nwindow.__set = function(name, value) {\n  window.__state[name] = value;\n  document.querySelectorAll(\'[data-spork-text="\' + name + \'"]\').forEach(function(el) { el.textContent = value; });\n  document.querySelectorAll(\'[data-spork-bind="\' + name + \'"]\').forEach(function(el) {\n    if (el.type === \'checkbox\') el.checked = !!value;\n    else if (el.value != value) el.value = value;\n  });\n  var ev = function(code) { return new Function(\'return (\' + code + \')\')(); };\n  document.querySelectorAll(\'[data-spork-style]\').forEach(function(el) { try { Object.assign(el.style, ev(el.dataset.sporkStyle)); } catch(_) {} });\n  document.querySelectorAll(\'[data-spork-if]\').forEach(function(el) { try { el.style.display = ev(el.dataset.sporkIf) ? \'\' : \'none\'; } catch(_) {} });\n  document.querySelectorAll(\'[data-spork-class]\').forEach(function(el) { try { var c = ev(el.dataset.sporkClass); if (typeof c === \'string\') el.className = (el.dataset.sporkBase || (el.dataset.sporkBase = el.className)) + \' \' + c; } catch(_) {} });\n};\n// Valor que el usuario escribe/elige → a PHP (State::get() lo ve) y a los demás widgets enlazados.\nwindow.__sync = function(n, v) {\n  try { fetch(\'http://127.0.0.1:%PORT%/event/%VEV%\', {method: \'POST\', mode: \'no-cors\', headers: {\'Content-Type\': \'text/plain\'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n};\n(function() {\n  function onUser(e) {\n    var el = e.target && e.target.closest ? e.target.closest(\'[data-spork-bind]\') : null;\n    if (!el) return;\n    var v = el.type === \'checkbox\' ? el.checked : (el.type === \'range\' || el.type === \'number\') ? Number(el.value) : el.value;\n    var n = el.getAttribute(\'data-spork-bind\');\n    window.__set(n, v);\n    window.__sync(n, v);\n  }\n  document.addEventListener(\'input\', onUser);\n  document.addEventListener(\'change\', onUser);\n})();\ndocument.addEventListener(\'click\', function(e) {      // Tabs\n  var b = e.target.closest ? e.target.closest(\'[data-ttarget]\') : null;\n  if (!b) return;\n  var g = b.dataset.ttarget, i = +b.dataset.tidx;\n  document.querySelectorAll(\'[data-tpanel]\').forEach(function(p) { if (p.dataset.tpanel === g) p.classList.toggle(\'sz-active\', +p.dataset.tidx === i); });\n  document.querySelectorAll(\'[data-ttarget]\').forEach(function(x) { if (x.dataset.ttarget === g) x.classList.toggle(\'sz-active\', +x.dataset.tidx === i); });\n});\nwindow.__toast = function(msg, v, ms) {\n  var c = document.getElementById(\'__vspk_toasts\');\n  if (!c) { c = document.createElement(\'div\'); c.className = \'sz-toast-container\'; c.id = \'__vspk_toasts\'; document.body.appendChild(c); }\n  var t = document.createElement(\'div\'); t.className = \'sz-toast\' + (v ? \' sz-toast-\' + v : \'\'); t.textContent = msg; c.appendChild(t);\n  setTimeout(function() { t.style.opacity = \'0\'; t.style.transition = \'opacity .3s\'; setTimeout(function() { t.remove(); }, 300); }, ms || 3000);\n};\nwindow.__vspk_cmd = function(cmd, a, b) {\n  try {\n    if (cmd === \'close\' || cmd === \'fullscreen\') window.ipc && window.ipc.postMessage(JSON.stringify({cmd: cmd === \'close\' ? \'close\' : \'toggleFullscreen\'}));\n    else if (cmd === \'setTitle\' && window.__vspk_api) window.__vspk_api.setTitle(a);\n    else if (cmd === \'setTitle\' && typeof __vspk !== \'undefined\') __vspk.setTitle(a);\n    else if (cmd === \'notify\' && typeof __vspk !== \'undefined\') __vspk.notify(a, b);\n  } catch(err) { console.error(err); }\n};\nwindow.__cv = function(id, op, a) {\n  var c = document.getElementById(id); if (!c) return;\n  var x = c.getContext(\'2d\');\n  if (op === \'clear\') { x.clearRect(0, 0, c.width, c.height); }\n  else if (op === \'color\') { x.fillStyle = a[0]; x.strokeStyle = a[0]; }\n  else if (op === \'lw\') { x.lineWidth = a[0]; }\n  else if (op === \'font\') { x.font = a[0] + \'px sans-serif\'; }\n  else if (op === \'line\') { x.beginPath(); x.moveTo(a[0], a[1]); x.lineTo(a[2], a[3]); x.stroke(); }\n  else if (op === \'rect\') { x.fillRect(a[0], a[1], a[2], a[3]); }\n  else if (op === \'frame\') { x.strokeRect(a[0], a[1], a[2], a[3]); }\n  else if (op === \'circle\') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.fill(); }\n  else if (op === \'ring\') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.stroke(); }\n  else if (op === \'text\') { x.fillText(a[2], a[0], a[1]); }\n  else if (op === \'poly\') { var p = a[0]; x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (var i = 1; i < p.length; i++) x.lineTo(p[i][0], p[i][1]); x.closePath(); x.fill(); }\n  else if (op === \'draw\') { new Function(\'ctx\', \'canvas\', a[0])(x, c); }\n};\nObject.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });\n(function connectSSE() {\n  var es = new EventSource(\'http://127.0.0.1:%PORT%/events\');\n  es.addEventListener(\'state\', function(e) { var d = JSON.parse(e.data); if (d.src && d.src === window.__win) return; window.__set(d.name, d.value); });\n  [%EVALEV%, \'all\'].forEach(function(n) { es.addEventListener(n, function(e) { try { (0, eval)(JSON.parse(e.data)); } catch(err) { console.error(err); } }); });\n  es.onerror = function() { es.close(); setTimeout(connectSSE, 1000); };\n})();'
+_PAGE_JS = 'window.__state = %STATE%;\nwindow.__win = %WIN%;\nwindow.__set = function(name, value) {\n  window.__state[name] = value;\n  document.querySelectorAll(\'[data-spork-text="\' + CSS.escape(name) + \'"]\').forEach(function(el) { el.textContent = value; });\n  document.querySelectorAll(\'[data-spork-bind="\' + CSS.escape(name) + \'"]\').forEach(function(el) {\n    if (el.type === \'checkbox\') el.checked = !!value;\n    else if (el.value != value) el.value = value;\n  });\n  var ev = function(code) { return new Function(\'return (\' + code + \')\')(); };\n  document.querySelectorAll(\'[data-spork-style]\').forEach(function(el) { try { Object.assign(el.style, ev(el.dataset.sporkStyle)); } catch(_) {} });\n  document.querySelectorAll(\'[data-spork-if]\').forEach(function(el) { try { el.style.display = ev(el.dataset.sporkIf) ? \'\' : \'none\'; } catch(_) {} });\n  document.querySelectorAll(\'[data-spork-class]\').forEach(function(el) { try { var c = ev(el.dataset.sporkClass); if (typeof c === \'string\') el.className = (el.dataset.sporkBase || (el.dataset.sporkBase = el.className)) + \' \' + c; } catch(_) {} });\n  var im = document.getElementById(name); if (im && im.tagName === \'IMG\' && value) { im.src = value; im.dataset.loaded = value; }   // ImgState\n};\n// Valor que el usuario escribe/elige → a PHP (State::get() lo ve) y a los demás widgets enlazados.\nwindow.__sync = function(n, v) {\n  try { fetch(\'http://127.0.0.1:%PORT%/event/%VEV%\', {method: \'POST\', mode: \'no-cors\', keepalive: true, headers: {\'Content-Type\': \'text/plain\'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n};\n(function() {\n  function onUser(e) {\n    var el = e.target && e.target.closest ? e.target.closest(\'[data-spork-bind]\') : null;\n    if (!el) return;\n    var v = el.type === \'checkbox\' ? el.checked : (el.type === \'range\' || el.type === \'number\') ? Number(el.value) : el.value;\n    var n = el.getAttribute(\'data-spork-bind\');\n    window.__set(n, v);\n    window.__sync(n, v);\n  }\n  document.addEventListener(\'input\', onUser);\n  document.addEventListener(\'change\', onUser);\n})();\ndocument.addEventListener(\'click\', function(e) {      // Tabs\n  var b = e.target.closest ? e.target.closest(\'[data-ttarget]\') : null;\n  if (!b) return;\n  var g = b.dataset.ttarget, i = +b.dataset.tidx;\n  document.querySelectorAll(\'[data-tpanel]\').forEach(function(p) { if (p.dataset.tpanel === g) p.classList.toggle(\'sz-active\', +p.dataset.tidx === i); });\n  document.querySelectorAll(\'[data-ttarget]\').forEach(function(x) { if (x.dataset.ttarget === g) x.classList.toggle(\'sz-active\', +x.dataset.tidx === i); });\n});\nwindow.__toast = function(msg, v, ms) {\n  var c = document.getElementById(\'__vspk_toasts\');\n  if (!c) { c = document.createElement(\'div\'); c.className = \'sz-toast-container\'; c.id = \'__vspk_toasts\'; document.body.appendChild(c); }\n  var t = document.createElement(\'div\'); t.className = \'sz-toast\' + (v ? \' sz-toast-\' + v : \'\'); t.textContent = msg; c.appendChild(t);\n  setTimeout(function() { t.style.opacity = \'0\'; t.style.transition = \'opacity .3s\'; setTimeout(function() { t.remove(); }, 300); }, ms || 3000);\n};\nwindow.__vspk_cmd = function(cmd, a, b) {\n  try {\n    if (cmd === \'close\' || cmd === \'fullscreen\') window.ipc && window.ipc.postMessage(JSON.stringify({cmd: cmd === \'close\' ? \'close\' : \'toggleFullscreen\'}));\n    else if (cmd === \'setTitle\' && window.__vspk_api) window.__vspk_api.setTitle(a);\n    else if (cmd === \'setTitle\' && typeof __vspk !== \'undefined\') __vspk.setTitle(a);\n    else if (cmd === \'notify\' && typeof __vspk !== \'undefined\') __vspk.notify(a, b);\n  } catch(err) { console.error(err); }\n};\nwindow.__cv = function(id, op, a) {\n  var c = document.getElementById(id); if (!c) return;\n  var x = c.getContext(\'2d\');\n  if (op === \'clear\') { x.clearRect(0, 0, c.width, c.height); }\n  else if (op === \'color\') { x.fillStyle = a[0]; x.strokeStyle = a[0]; }\n  else if (op === \'lw\') { x.lineWidth = a[0]; }\n  else if (op === \'font\') { x.font = a[0] + \'px sans-serif\'; }\n  else if (op === \'line\') { x.beginPath(); x.moveTo(a[0], a[1]); x.lineTo(a[2], a[3]); x.stroke(); }\n  else if (op === \'rect\') { x.fillRect(a[0], a[1], a[2], a[3]); }\n  else if (op === \'frame\') { x.strokeRect(a[0], a[1], a[2], a[3]); }\n  else if (op === \'circle\') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.fill(); }\n  else if (op === \'ring\') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.stroke(); }\n  else if (op === \'text\') { x.fillText(a[2], a[0], a[1]); }\n  else if (op === \'poly\') { var p = a[0]; x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (var i = 1; i < p.length; i++) x.lineTo(p[i][0], p[i][1]); x.closePath(); x.fill(); }\n  else if (op === \'draw\') { new Function(\'ctx\', \'canvas\', a[0])(x, c); }\n};\nObject.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });\n(function connectSSE() {\n  var es = new EventSource(\'http://127.0.0.1:%PORT%/events\');\n  es.addEventListener(\'state\', function(e) { var d = JSON.parse(e.data); if (d.src && d.src === window.__win) return; window.__set(d.name, d.value); });\n  [%EVALEV%, \'all\'].forEach(function(n) { es.addEventListener(n, function(e) { try { (0, eval)(JSON.parse(e.data)); } catch(err) { console.error(err); } }); });\n  es.onerror = function() { es.close(); setTimeout(connectSSE, 1000); };\n})();'
 
 
 class App:
@@ -992,10 +1067,12 @@ class App:
         (la URL completa lleva el puerto: usa window.__vspk_port o la que ves en la página).
         También acepta eventos via IPC (window.ipc.postMessage) cuando vspk los reenvía al socket.
         """
-        self._event_handlers.setdefault(event, []).append(handler)
-        if not hasattr(self, "_ipc_thread") or not self._ipc_thread.is_alive():
-            self._ipc_thread = threading.Thread(target=self._listen_ipc, daemon=True)
-            self._ipc_thread.start()
+        with _ipc_start_lock:
+            self._event_handlers.setdefault(event, []).append(handler)
+            t = getattr(self, "_ipc_thread", None)
+            if t is None or not t.is_alive():
+                self._ipc_thread = threading.Thread(target=self._listen_ipc, daemon=True)
+                self._ipc_thread.start()
 
     # ── SSE ───────────────────────────────────────────────────────────────────
 
@@ -1025,6 +1102,32 @@ class App:
 
     def copy_text(self, text: str) -> None:
         self.eval_js(f"__vspk.clipboard.write({_js(text)})")
+
+    # ── Gestión de la ventana principal por IPC con vspk ─────────────────────────
+    #   app.move(100, 50) · app.resize(800, 600) · app.snap("left"|"right"|…) · app.focus()
+    #   Devuelven bool: False si vspk no expone el pipe o la ventana aún no está registrada.
+    _main_win_id: int = -1      # -1 = sin resolver, 0 = no disponible
+    _main_before: set = frozenset()
+    _main_htv: str = ""
+
+    def _main_id(self) -> int:
+        if self._main_win_id < 0:
+            self._main_win_id = _resolve_win_id(self._main_before, self._main_htv) if self._main_htv else 0
+        return self._main_win_id
+
+    def _win_cmd(self, w: Optional[ChildWindow], cmd: str, **extra) -> bool:
+        if w is None:
+            wid = self._main_id()
+        else:
+            if w.win_id < 0:
+                w.win_id = _resolve_win_id(w.before, w.htv) if (w.proc is not None and w.htv) else 0
+            wid = w.win_id
+        return _win_cmd(wid, cmd, **extra)
+
+    def focus(self) -> bool:                  return self._win_cmd(None, "focus")
+    def move(self, x: int, y: int) -> bool:   return self._win_cmd(None, "move", x=x, y=y)
+    def resize(self, w: int, h: int) -> bool: return self._win_cmd(None, "resize", w=w, h=h)
+    def snap(self, pos: str) -> bool:         return self._win_cmd(None, "snap", pos=pos)
 
     def quit(self) -> None:
         self._quit = True
@@ -1221,6 +1324,11 @@ class App:
         if op == "clear":
             self._cv_logs[cid] = ""
         self._cv_logs[cid] = self._cv_logs.get(cid, "") + js + ";"
+        # Tope: el log se reenvía entero al cargar/reconectar; descarta lo más antiguo en límite de sentencia.
+        if len(self._cv_logs[cid]) > 1_000_000:
+            cut = self._cv_logs[cid].find(";__cv(", 500_000)
+            if cut != -1:
+                self._cv_logs[cid] = self._cv_logs[cid][cut + 1:]
         if self._running:
             self._push_sse("all", js)
 
@@ -1269,7 +1377,13 @@ class App:
             self._win_eval(w, "__vspk.cancelClose()" if r is False else "__vspk.confirmClose()")
         self._events[ev] = _h_close
 
+    _open_lock = threading.Lock()   # serializa las aperturas: cada ventana calcula su id sin pisar a otra
+
     def _win_open(self, w: ChildWindow) -> None:
+        with self._open_lock:
+            self._win_open_now(w)
+
+    def _win_open_now(self, w: ChildWindow) -> None:
         if w.is_open():
             return
         if w.htv:
@@ -1280,6 +1394,8 @@ class App:
         _ic = self._find_icon()
         head = f"title: {w.title}\nwidth: {w.width}\nheight: {w.height}\ndevtools: true\n" + (f"icon: {_ic}\n" if _ic else "") + ("on_close: confirm\n" if w.close_on else "")
         w.htv = self._write_htv(head + "\n" + page)
+        self._main_id()   # que la principal ya tenga su id: así la ventana nueva es la única "nueva"
+        w.before, w.win_id = _win_ids(), -1
         w.proc = self._spawn(w.htv)
 
     # ── Widgets acumulados ────────────────────────────────────────────────────
@@ -1363,7 +1479,14 @@ class App:
 
             def do_POST(self):
                 path = urlparse(self.path).path
-                length = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > 4 * 1024 * 1024:
+                    self.close_connection = True
+                    self._reply(413 if length > 0 else 400)
+                    return
                 body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
                 if path.startswith("/event/"):
                     app_ref._q.put(("event", path[7:], body))
@@ -1440,9 +1563,8 @@ class App:
                 return
             fn = self._events.get(name)
             if fn:
-                fn(data)
-                return
-            for h in self._event_handlers.get(name, []):
+                fn(data)          # handler interno (on/_events) y, además, los públicos de on_event
+            for h in list(self._event_handlers.get(name, [])):
                 h(data)
         except Exception as e:
             import traceback
@@ -1556,7 +1678,10 @@ class App:
     def _find_icon(self) -> str:
         import inspect
         try:
-            caller_file = inspect.stack()[-1].filename
+            main_mod = sys.modules.get("__main__")
+            caller_file = getattr(main_mod, "__file__", None) or ""
+            if not caller_file or not os.path.isfile(caller_file):
+                caller_file = sys.argv[0] if sys.argv and os.path.isfile(sys.argv[0]) else inspect.stack()[-1].filename
             caller_dir  = os.path.dirname(os.path.abspath(caller_file))
             base        = os.path.splitext(os.path.basename(caller_file))[0]
         except Exception:
@@ -1594,6 +1719,7 @@ class App:
                 + ("on_close: confirm\n" if self._close_on else ""))
         htv_path = self._write_htv(head + "\n" + html)
         proc = None
+        self._main_htv, self._main_win_id, self._main_before = htv_path, -1, _win_ids()
         try:
             proc = self._spawn(htv_path)
             self._running = True
@@ -1654,6 +1780,11 @@ class Window:
 
     @property
     def id(self) -> int:
+        if not self._id and self._process.poll() is None:
+            # vspk tardó en registrarse en open(): reintento puntual (el id es el PID de su proceso)
+            wins = (_ipc_send({"cmd": "list"}) or {}).get("windows", [])
+            if any(w.get("id") == self._process.pid for w in wins):
+                self._id = self._process.pid
         return self._id
 
     def is_open(self) -> bool:
@@ -1663,35 +1794,40 @@ class Window:
         self._process.wait()
 
     def close(self) -> None:
-        _ipc_send({"cmd": "unregister", "id": self._id})
+        _ipc_send({"cmd": "unregister", "id": self.id})
+        # unregister solo quita el registro IPC; para cerrar la ventana hay que terminar su proceso vspk
+        if self._process.poll() is None:
+            try: self._process.terminate()
+            except OSError: pass
 
     def send(self, payload: Any) -> bool:
-        result = _ipc_send({"cmd": "send", "to": self._id, "payload": payload})
+        result = _ipc_send({"cmd": "send", "to": self.id, "payload": payload})
         return bool(result and result.get("ok"))
 
     def focus(self) -> bool:
-        result = _ipc_send({"cmd": "focus", "id": self._id})
+        result = _ipc_send({"cmd": "focus", "id": self.id})
         return bool(result and result.get("ok"))
 
     def move(self, x: int, y: int) -> bool:
-        result = _ipc_send({"cmd": "move", "id": self._id, "x": x, "y": y})
+        result = _ipc_send({"cmd": "move", "id": self.id, "x": x, "y": y})
         return bool(result and result.get("ok"))
 
     def resize(self, w: int, h: int) -> bool:
-        result = _ipc_send({"cmd": "resize", "id": self._id, "w": w, "h": h})
+        result = _ipc_send({"cmd": "resize", "id": self.id, "w": w, "h": h})
         return bool(result and result.get("ok"))
 
     def snap(self, pos: str) -> bool:
-        result = _ipc_send({"cmd": "snap", "id": self._id, "pos": pos})
+        result = _ipc_send({"cmd": "snap", "id": self.id, "pos": pos})
         return bool(result and result.get("ok"))
 
     def on_event(self, event: str, handler: Callable[[Any], None]) -> None:
-        self._event_handlers.setdefault(event, []).append(handler)
-        if not self._ipc_thread or not self._ipc_thread.is_alive():
-            self._ipc_thread = threading.Thread(
-                target=self._listen_ipc, daemon=True
-            )
-            self._ipc_thread.start()
+        with _ipc_start_lock:
+            self._event_handlers.setdefault(event, []).append(handler)
+            if not self._ipc_thread or not self._ipc_thread.is_alive():
+                self._ipc_thread = threading.Thread(
+                    target=self._listen_ipc, daemon=True
+                )
+                self._ipc_thread.start()
 
     def _listen_ipc(self) -> None:
         while self.is_open():
@@ -1707,7 +1843,7 @@ class Window:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.connect(_SOCK_UNIX)
             reg = json.dumps({"cmd": "register", "info": {
-                "id": self._id or 1, "title": "_py_listener",
+                "id": self.id or 1, "title": "_py_listener",
                 "x": 0, "y": 0, "w": 0, "h": 0, "file": ""
             }}) + "\n"
             s.sendall(reg.encode())
@@ -1723,7 +1859,7 @@ class Window:
 
     def _listen_ipc_windows(self) -> None:
         reg  = (json.dumps({"cmd": "register", "info": {
-            "id": self._id or 1, "title": "_py_listener",
+            "id": self.id or 1, "title": "_py_listener",
             "x": 0, "y": 0, "w": 0, "h": 0, "file": ""
         }}) + "\n").encode()
         poll = (json.dumps({"cmd": "poll"}) + "\n").encode()
@@ -1823,10 +1959,24 @@ def open(
             break
         time.sleep(0.05)
 
-    win_id = 0
-    result = _ipc_send({"cmd": "list"})
-    if result and result.get("windows"):
-        win_id = max(w["id"] for w in result["windows"])
+    if title or width or height:
+        try: os.unlink(cfg_path)   # vspk ya leyó la config: no dejar basura en %TEMP%
+        except OSError: pass
+
+    # El id de ventana de vspk es el PID de su proceso: esperamos (≤2 s) a que se registre; si esta versión
+    # de vspk no usa PIDs como id, se queda con el mayor id de la lista, como antes.
+    win_id, wins = 0, []
+    for _ in range(60):
+        wins = (_ipc_send({"cmd": "list"}) or {}).get("windows", [])
+        if any(w.get("id") == process.pid for w in wins):
+            break
+        time.sleep(0.05)
+    if any(w.get("id") == process.pid for w in wins):
+        win_id = process.pid
+    else:
+        ids = [w["id"] for w in wins if isinstance(w.get("id"), int)]
+        if ids:
+            win_id = max(ids)
 
     return Window(id=win_id, process=process)
 

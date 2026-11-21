@@ -31,6 +31,8 @@ let _cv_ids    = []
 let _wins      = []      # ventanas adicionales (gui.window)
 let mut _win_count = 0
 let _cv_logs   = {}      # id de canvas -> JS de sus dibujos (se reproduce al cargar la página)
+let _cv_prev   = {}      # id -> generación anterior del log (el log se rota cada 10000 ops: tope de memoria)
+let _cv_n      = {}      # id -> nº de ops de la generación actual
 let mut _cv_mouse_js = ""
 
 # ── Buscar ejecutable vspk ───────────────────────────────────────────────────
@@ -516,8 +518,16 @@ fn quit()                    { eval_js("__vspk.close()") }
 
 fn _cv_do(id, op, args) {
   let js = "__cv(\(to_json(id)),\(to_json(op)),\(to_json(args)))"
-  if op == "clear" { _cv_logs[id] = "" }
+  if op == "clear" { _cv_logs[id] = ""
+    _cv_prev[id] = ""
+    _cv_n[id] = 0 }
   _cv_logs[id] = "\(_cv_logs[id])\(js);"
+  _cv_n[id] = _cv_n[id] + 1
+  if _cv_n[id] > 10000 {      # rotar: descarta la generación más antigua, siempre en límite de sentencia
+    _cv_prev[id] = _cv_logs[id]
+    _cv_logs[id] = ""
+    _cv_n[id] = 0
+  }
   if _running { _push_sse("all", js) }
   true
 }
@@ -534,6 +544,8 @@ fn _cv_on_mouse(id, fn_cb) {
 
 fn canvas(id, w, h) {
   _cv_logs[id] = ""
+  _cv_prev[id] = ""
+  _cv_n[id] = 0
   _cv_ids.push(id)
 
   fn to_html() {
@@ -645,7 +657,7 @@ fn _win_is_open(info) {
 #   Atajos: "ctrl+o", "ctrl+shift+s", "alt+x", "f5"... (orden: ctrl, shift, alt, tecla).
 
 fn MenuItem(label, js = "", shortcut = "") {
-  let click = js.replace("\"", "&quot;")
+  let click = html_escape(js)
   let kbd = if shortcut != "" { "<kbd>\(html_escape(shortcut))</kbd>" } else { "" }
   "<button type=\"button\" class=\"sz-menu-item\" onclick=\"\(click)\" data-accel=\"\(html_escape(shortcut))\"><span>\(html_escape(label))</span>\(kbd)</button>"
 }
@@ -685,7 +697,7 @@ fn _page_html(title, body_html, eval_ev, is_main, child_close_js) {
   } else { "" }
   let close_js = main_close_js + child_close_js
   let timers_js = if is_main { _timers.join(";") + ";" } else { "" }
-  let cv_js = "\(_cv_ids.map(fn(i) { _cv_logs[i] }).join(""))\(_cv_mouse_js)"
+  let cv_js = "\(_cv_ids.map(fn(i) { _cv_prev[i] + _cv_logs[i] }).join(""))\(_cv_mouse_js)"
   let accent_style = if _accent != "" {
     "<style>:root{--sz-accent:\(_accent);} .sz-btn-filled{background:\(_accent);border-color:\(_accent);}</style>"
   } else { "" }
@@ -712,10 +724,10 @@ window.__win = '\(eval_ev)';
 
 window.__set = function(name, value) {
   window.__state[name] = value;
-  document.querySelectorAll('[data-spork-text=\"' + name + '\"]').forEach(function(el) {
+  document.querySelectorAll('[data-spork-text=\"' + CSS.escape(name) + '\"]').forEach(function(el) {
     el.textContent = value;
   });
-  document.querySelectorAll('[data-spork-bind=\"' + name + '\"]').forEach(function(el) {
+  document.querySelectorAll('[data-spork-bind=\"' + CSS.escape(name) + '\"]').forEach(function(el) {
     if (el.type === 'checkbox') el.checked = value;
     else el.value = value;
   });
@@ -734,7 +746,7 @@ window.__set = function(name, value) {
 // (los widgets enlazados solo actualizaban la página). POST simple (text/plain, no-cors).
 window.__sync = function(n, v) {
   try {
-    fetch('http://127.0.0.1:\(_port)/event/\(_ev("v"))', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})});
+    fetch('http://127.0.0.1:\(_port)/event/\(_ev("v"))', {method: 'POST', mode: 'no-cors', keepalive: true, headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})});
   } catch(_) {}
 };
 

@@ -1,26 +1,28 @@
+const __out = (...a) => console.log(...a.map(v => typeof v === 'bigint' ? String(v) : v));
+
 async function find_vspk() {
   let exe, from_env, beside_script, beside_lib, in_path;
   exe = (() => {
-    if ((process.platform === "win32")) {
+    if (process.platform === "win32") {
       return "vspk.exe";
     } else {
       return "vspk";
     }
   })();
-  from_env = (process.env["VSPK_EXE"] ?? "");
-  if (((from_env !== "") && (await Bun.file(from_env).exists()))) {
+  from_env = process.env["VSPK_EXE"] ?? "";
+  if (from_env !== "" && (await Bun.file(from_env).exists())) {
     return from_env;
   }
   beside_script = (await import('node:path')).join((await import('node:path')).dirname(import.meta.dir), exe);
-  if ((await Bun.file(beside_script).exists())) {
+  if (await Bun.file(beside_script).exists()) {
     return beside_script;
   }
   beside_lib = (await import('node:path')).join(import.meta.dir, exe);
-  if ((await Bun.file(beside_lib).exists())) {
+  if (await Bun.file(beside_lib).exists()) {
     return beside_lib;
   }
-  in_path = (await (async (__n) => { const { delimiter, join } = await import('node:path'); const __exts = process.platform === 'win32' ? ['', ...(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').toLowerCase().split(';')] : ['']; for (const __d of (process.env.PATH ?? '').split(delimiter)) { if (!__d) continue; for (const __e of __exts) { const __p = join(__d, String(__n) + __e); if (await Bun.file(__p).exists()) return __p; } } return ''; })(exe));
-  if ((in_path !== "")) {
+  in_path = await (async (__n) => { const { delimiter, join } = await import('node:path'); const __exts = process.platform === 'win32' ? ['', ...(process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').toLowerCase().split(';')] : ['']; for (const __d of (process.env.PATH ?? '').split(delimiter)) { if (!__d) continue; for (const __e of __exts) { const __p = join(__d, String(__n) + __e); if (await Bun.file(__p).exists()) return __p; } } return ''; })(exe);
+  if (in_path !== "") {
     return in_path;
   }
   return exe;
@@ -33,7 +35,7 @@ function html_escape(s) {
 function tag(t, css_class, attrs, ...kids) {
   let cls_attr, attrs_str, inner, _spk_void;
   cls_attr = (() => {
-    if ((css_class !== "")) {
+    if (css_class !== "") {
       return ` class=\"${css_class}\"`;
     } else {
       return "";
@@ -43,23 +45,23 @@ function tag(t, css_class, attrs, ...kids) {
     let k, v;
     k = kv[0];
     v = kv[1];
-    if ((((k === "onclick") || (k === "oninput")) || (k === "onchange"))) {
+    if (k === "onclick" || k === "oninput" || k === "onchange") {
       return ` ${k}=\"${v.replaceAll("\"", "&quot;")}\"`;
     } else {
       return ` ${k}=\"${html_escape(v)}\"`;
     }
   }).join("");
   inner = kids.map((c) => {
-    if (((((Array.isArray(c) ? 'array' : typeof c) === "hash") || ((Array.isArray(c) ? 'array' : typeof c) === "object")) && c.to_html)) {
+    if (((Array.isArray(c) ? 'array' : typeof c) === "hash" || (Array.isArray(c) ? 'array' : typeof c) === "object") && c.to_html) {
       return c.to_html();
     } else {
       return `${c}`;
     }
   }).join("\n");
-  _spk_void = (((t === "input") || (t === "hr")) || (t === "br"));
+  _spk_void = t === "input" || t === "hr" || t === "br";
   if (_spk_void) {
     return `<${t}${cls_attr}${attrs_str}>`;
-  } else if ((inner === "")) {
+  } else if (inner === "") {
     return `<${t}${cls_attr}${attrs_str}></${t}>`;
   } else {
     return `<${t}${cls_attr}${attrs_str}>\n${inner}\n</${t}>`;
@@ -133,7 +135,7 @@ function Chip(text, primary = false) {
 function Alert(c, variant = "") {
   let css_class;
   css_class = (() => {
-    if ((variant !== "")) {
+    if (variant !== "") {
       return `sz-alert sz-alert-${variant}`;
     } else {
       return "sz-alert";
@@ -145,14 +147,14 @@ function Alert(c, variant = "") {
 function Button(text, js = "", variant = "filled", size = "") {
   let css_class, attrs;
   css_class = `sz-btn sz-btn-${variant}${(() => {
-    if ((size !== "")) {
+    if (size !== "") {
       return ` sz-btn-${size}`;
     } else {
       return "";
     }
   })()}`;
   attrs = (() => {
-    if ((js !== "")) {
+    if (js !== "") {
       return { "data-ripple": "", onclick: js };
     } else {
       return { "data-ripple": "" };
@@ -164,10 +166,10 @@ function Button(text, js = "", variant = "filled", size = "") {
 function Input(placeholder = "", bind = null) {
   let attrs;
   attrs = { type: "text" };
-  if ((placeholder !== "")) {
+  if (placeholder !== "") {
     attrs["placeholder"] = placeholder;
   }
-  if ((bind !== null)) {
+  if (bind !== null) {
     attrs["data-spork-bind"] = bind.name;
     attrs["oninput"] = `window.__set('${bind.name}',this.value);window.__sync('${bind.name}',this.value)`;
   }
@@ -177,10 +179,10 @@ function Input(placeholder = "", bind = null) {
 function Textarea(placeholder = "", rows = 4, bind = null) {
   let attrs;
   attrs = { rows: `${rows}` };
-  if ((placeholder !== "")) {
+  if (placeholder !== "") {
     attrs["placeholder"] = placeholder;
   }
-  if ((bind !== null)) {
+  if (bind !== null) {
     attrs["data-spork-bind"] = bind.name;
     attrs["oninput"] = `window.__set('${bind.name}',this.value);window.__sync('${bind.name}',this.value)`;
   }
@@ -190,7 +192,7 @@ function Textarea(placeholder = "", rows = 4, bind = null) {
 function Checkbox(label_text, bind = null) {
   let attrs, chk, track, lbl;
   attrs = { type: "checkbox" };
-  if ((bind !== null)) {
+  if (bind !== null) {
     attrs["data-spork-checked"] = bind.name;
     attrs["onchange"] = `window.__set('${bind.name}',this.checked);window.__sync('${bind.name}',this.checked)`;
   }
@@ -209,7 +211,7 @@ function Select(options, bind = null) {
     return `<option value=\"${html_escape(val)}\">${html_escape(lbl)}</option>`;
   }).join("\n");
   attrs = {  };
-  if ((bind !== null)) {
+  if (bind !== null) {
     attrs["data-spork-bind"] = bind.name;
     attrs["onchange"] = `window.__set('${bind.name}',this.value);window.__sync('${bind.name}',this.value)`;
   }
@@ -263,17 +265,17 @@ function state(name, initial) {
     return _push_state(name, val);
   }
   function inc(by = 1) {
-    return set((get() + by));
+    return set(get() + by);
   }
   function dec(by = 1) {
-    return set((get() - by));
+    return set(get() - by);
   }
   return { name: name, to_html: to_html, js_get: js_get, js_set: js_set, js_inc: js_inc, js_dec: js_dec, get: get, set: set, inc: inc, dec: dec, __str__: () => to_html() };
 }
 
 function on_click(fn_cb) {
   let id;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   id = `cb_${_token}_${_cb_count}`;
   _callbacks[id] = fn_cb;
   return `fetch('http://127.0.0.1:${_port}/cb/${id}',{mode:'no-cors'})`;
@@ -321,10 +323,10 @@ function on_close(fn_cb) {
   return on_event(_ev("c"), (d) => {
     let r;
     r = _safe_true(fn_cb);
-    if ((r === false)) {
+    if (r === false) {
       eval_js("__vspk.cancelClose()");
     }
-    if ((r !== false)) {
+    if (r !== false) {
       eval_js("__vspk.confirmClose()");
     }
   });
@@ -332,7 +334,7 @@ function on_close(fn_cb) {
 
 function _dialog(kind, title, fn_cb) {
   let name;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   name = _ev(`d${_cb_count}`);
   on_event(name, (d) => _call1(fn_cb, d["path"]));
   return eval_js(`__vspk.dialog({kind:'${kind}',title:${JSON.stringify(title)}}).then(function(p){${_post_js(name, "JSON.stringify({path:p})")}})`);
@@ -350,19 +352,201 @@ function pick_folder(title, fn_cb) {
   return _dialog("folder", title, fn_cb);
 }
 
+function on_vspk_error(fn_cb) {
+  _on_error = fn_cb;
+}
+
+function _call2(f, a, b) {
+  let h;
+  h = { f: f };
+  return (h["f"])(a, b);
+}
+
+function call(expr, fn_cb) {
+  let name;
+  _cb_count = _cb_count + 1;
+  name = _ev(`r${_cb_count}`);
+  on_event(name, (d) => {
+    let msg;
+    if (d !== null && d["ok"] === true) {
+      if (fn_cb !== null) {
+        _call1(fn_cb, d["r"]);
+      }
+    } else {
+      msg = (() => {
+        if (d !== null) {
+          return `${d["e"]}`;
+        } else {
+          return "sin respuesta";
+        }
+      })();
+      if (_on_error !== null) {
+        return _call1(_on_error, msg);
+      } else {
+        return __out(`[vspk] error: ${msg}`);
+      }
+    }
+  });
+  return eval_js(`Promise.resolve(${expr}).then(function(r){${_post_js(name, "JSON.stringify({ok:true,r:r})")}}).catch(function(e){${_post_js(name, "JSON.stringify({ok:false,e:String(e&&e.message||e)})")}})`);
+}
+
+function invoke(cmd, args, fn_cb) {
+  return call(`__vspk.invoke(${JSON.stringify(cmd)},${JSON.stringify(args)})`, fn_cb);
+}
+
+function sql_open(name, fn_cb) {
+  return call(`__vspk.sql.open(${JSON.stringify(name)})`, fn_cb);
+}
+
+function sql_exec(db, sql, params, fn_cb) {
+  return call(`__vspk.sql.exec(${JSON.stringify(db)},${JSON.stringify(sql)},${JSON.stringify(params)})`, fn_cb);
+}
+
+function sql_query(db, sql, params, fn_cb) {
+  return call(`__vspk.sql.query(${JSON.stringify(db)},${JSON.stringify(sql)},${JSON.stringify(params)})`, fn_cb);
+}
+
+function sql_close(db, fn_cb) {
+  return call(`__vspk.sql.close(${JSON.stringify(db)})`, fn_cb);
+}
+
+function read_file(path, fn_cb) {
+  return call(`__vspk.readFile(${JSON.stringify(path)},'utf8')`, fn_cb);
+}
+
+function write_file(path, data, fn_cb) {
+  return call(`__vspk.writeFile(${JSON.stringify(path)},${JSON.stringify(data)},'utf8')`, fn_cb);
+}
+
+function file_exists(path, fn_cb) {
+  return call(`__vspk.exists(${JSON.stringify(path)})`, fn_cb);
+}
+
+function read_dir(path, fn_cb) {
+  return call(`__vspk.readDir(${JSON.stringify(path)})`, fn_cb);
+}
+
+function http_fetch(url, opts, fn_cb) {
+  return call(`__vspk.fetch(${JSON.stringify(url)},${JSON.stringify(opts)})`, fn_cb);
+}
+
+function env_get(key, fn_cb) {
+  return call(`__vspk.env(${JSON.stringify(key)})`, fn_cb);
+}
+
+function clipboard_read(fn_cb) {
+  return call("__vspk.clipboard.read()", fn_cb);
+}
+
+function ping(host, timeout_ms, fn_cb) {
+  return call(`__vspk.ping(${JSON.stringify(host)},${timeout_ms})`, fn_cb);
+}
+
+function wifi_scan(fn_cb) {
+  return call("__vspk.wifiScan()", fn_cb);
+}
+
+function _ensure_stream() {
+  let name;
+  if (_stream_on) {
+    return 0;
+  }
+  _stream_on = true;
+  name = _ev("stream");
+  on_event(name, (d) => {
+    let key;
+    if (d === null) {
+      return 0;
+    }
+    key = (() => {
+      if (((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(d, "__vspk_proc")) {
+        return `proc:${d["__vspk_proc"]}`;
+      } else {
+        return `serial:${d["__vspk_serial"]}`;
+      }
+    })();
+    if (((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(_streams, key)) {
+      _call1(_streams[key], d);
+    }
+  });
+  return eval_js(`if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){${_post_js(name, "JSON.stringify(d)")}}})}`);
+}
+
+function proc_open(path, on_line, on_exit, fn_id) {
+  _ensure_stream();
+  return invoke("procOpen", { path: path }, (pid) => {
+    _streams[`proc:${pid}`] = (d) => {
+      if (d["k"] === "exit") {
+        if (on_exit !== null) {
+          _call1(on_exit, d["code"]);
+        }
+      }
+      if (d["k"] !== "exit") {
+        _call2(on_line, d["k"], d["line"]);
+      }
+    };
+    if (fn_id !== null) {
+      _call1(fn_id, pid);
+    }
+  });
+}
+
+function proc_send(pid, line) {
+  return invoke("procSend", { id: pid, line: line }, null);
+}
+
+function proc_close(pid) {
+  return invoke("procClose", { id: pid }, null);
+}
+
+function serial_list(fn_cb, scan) {
+  return invoke("serialList", { scan: scan }, fn_cb);
+}
+
+function ble_scan(fn_cb) {
+  return serial_list(fn_cb, true);
+}
+
+function serial_open(port, baud, on_line, on_close, fn_id) {
+  _ensure_stream();
+  return invoke("serialOpen", { port: port, baud: baud }, (sid) => {
+    _streams[`serial:${sid}`] = (d) => {
+      if (d["k"] === "close") {
+        if (on_close !== null) {
+          _call0(on_close);
+        }
+      }
+      if (d["k"] !== "close") {
+        _call2(on_line, d["k"], d["line"]);
+      }
+    };
+    if (fn_id !== null) {
+      _call1(fn_id, sid);
+    }
+  });
+}
+
+function serial_write(sid, line, nl) {
+  return invoke("serialWrite", { id: sid, line: line, nl: nl }, null);
+}
+
+function serial_close(sid) {
+  return invoke("serialClose", { id: sid }, null);
+}
+
 function _modal(call, kind, fn_cb) {
   let name;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   name = _ev(`m${_cb_count}`);
   on_event(name, (d) => {
-    if ((fn_cb !== null)) {
-      if ((kind === "message")) {
+    if (fn_cb !== null) {
+      if (kind === "message") {
         _call0(fn_cb);
       }
-      if ((kind === "confirm")) {
-        _call1(fn_cb, (d["v"] === true));
+      if (kind === "confirm") {
+        _call1(fn_cb, d["v"] === true);
       }
-      if ((kind === "prompt")) {
+      if (kind === "prompt") {
         _call1(fn_cb, d["v"]);
       }
     }
@@ -384,7 +568,7 @@ function prompt(text, fn_cb, default_value) {
 
 function _vt_ev(fn_cb) {
   let name;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   name = _ev(`v${_cb_count}`);
   on_event(name, (d) => _call1(fn_cb, d));
   return _post_js(name, "JSON.stringify(p)");
@@ -393,26 +577,26 @@ function _vt_ev(fn_cb) {
 function _vt_attrs(el_id, cfg, on_select, on_dblclick, on_sort, style = "") {
   let attrs;
   attrs = { id: el_id, "data-vt": JSON.stringify(cfg) };
-  if ((style !== "")) {
+  if (style !== "") {
     attrs["style"] = style;
   }
-  if ((on_select !== null)) {
+  if (on_select !== null) {
     attrs["data-on-select"] = _vt_ev(on_select);
   }
-  if ((on_dblclick !== null)) {
+  if (on_dblclick !== null) {
     attrs["data-on-dblclick"] = _vt_ev(on_dblclick);
   }
-  if ((on_sort !== null)) {
+  if (on_sort !== null) {
     attrs["data-on-sort"] = _vt_ev(on_sort);
   }
   return attrs;
 }
 
 function _vt_id(prefix, el_id) {
-  if ((el_id !== "")) {
+  if (el_id !== "") {
     return el_id;
   }
-  _vt_count = (_vt_count + 1);
+  _vt_count = _vt_count + 1;
   return `${prefix}${_vt_count}`;
 }
 
@@ -420,7 +604,7 @@ function Table(cols, rows, on_select = null, on_dblclick = null, on_sort = null,
   let el_id, cfg;
   el_id = _vt_id("vt", id);
   cfg = { cols: cols, rows: rows, sortable: sortable, multi: multi, striped: true, header: header, selected: (-1) };
-  if ((height !== "")) {
+  if (height !== "") {
     cfg["height"] = height;
   }
   return tag("div", "vspk-table", _vt_attrs(el_id, cfg, on_select, on_dblclick, on_sort));
@@ -431,7 +615,7 @@ function Listbox(items, on_select = null, on_dblclick = null, height = "", id = 
   rows = items.map((x) => [x]);
   el_id = _vt_id("vt", id);
   cfg = { cols: [""], rows: rows, sortable: false, multi: false, striped: false, header: false, selected: (-1) };
-  if ((height !== "")) {
+  if (height !== "") {
     cfg["height"] = height;
   }
   return tag("div", "vspk-table", _vt_attrs(el_id, cfg, on_select, on_dblclick, null));
@@ -441,7 +625,7 @@ function Tree(nodes, on_select = null, on_dblclick = null, height = "", id = "")
   let el_id, st;
   el_id = _vt_id("vtree", id);
   st = (() => {
-    if ((height !== "")) {
+    if (height !== "") {
       return `max-height:${height}`;
     } else {
       return "";
@@ -453,7 +637,7 @@ function Tree(nodes, on_select = null, on_dblclick = null, height = "", id = "")
 function table_set_js(el_id, rows, cols = null) {
   let c;
   c = (() => {
-    if ((cols === null)) {
+    if (cols === null) {
       return "null";
     } else {
       return JSON.stringify(cols);
@@ -512,7 +696,7 @@ function DatePicker(bind, with_time = false) {
 
 function _timer(js_fn, ms, fn_cb) {
   let name, js;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   name = _ev(`t${_cb_count}`);
   on_event(name, (d) => _call0(fn_cb));
   js = `${js_fn}(function(){${_post_js(name, "'{}'")}},${ms})`;
@@ -550,7 +734,7 @@ function quit() {
 function _cv_do(id, op, args) {
   let js;
   js = `__cv(${JSON.stringify(id)},${JSON.stringify(op)},${JSON.stringify(args)})`;
-  if ((op === "clear")) {
+  if (op === "clear") {
     _cv_logs[id] = "";
   }
   _cv_logs[id] = `${_cv_logs[id]}${js};`;
@@ -562,11 +746,11 @@ function _cv_do(id, op, args) {
 
 function _cv_on_mouse(id, fn_cb) {
   let name, js;
-  _cb_count = (_cb_count + 1);
+  _cb_count = _cb_count + 1;
   name = _ev(`m${_cb_count}`);
   on_event(name, fn_cb);
   js = `(function(){var c=document.getElementById('${id}');if(!c)return;function p(t,e){if(t==='move'){var n=Date.now();if(n-(c.__lm||0)<30)return;c.__lm=n;}var r=c.getBoundingClientRect();${_post_js(name, "JSON.stringify({type:t,x:Math.round((e.clientX-r.left)*c.width/r.width),y:Math.round((e.clientY-r.top)*c.height/r.height),button:e.button})")}}['down','up','move','click'].forEach(function(t){c.addEventListener(t==='down'?'mousedown':t==='up'?'mouseup':t==='move'?'mousemove':'click',function(e){p(t,e)})})})();`;
-  _cv_mouse_js = (_cv_mouse_js + js);
+  _cv_mouse_js = _cv_mouse_js + js;
   if (_running) {
     _push_sse("all", js);
   }
@@ -577,46 +761,46 @@ function canvas(id, w, h) {
   _cv_logs[id] = "";
   _cv_ids.push(id);
   function to_html() {
-    return `<canvas id=\"${((__a0) => (__a0))}\" width=\"${w}\" height=\"${h}\" style=\"width:${w}px;max-width:100%;height:auto;border:1px solid rgba(128,128,128,.4);border-radius:8px;touch-action:none\"></canvas>`;
+    return `<canvas id=\"${(__a0) => (__a0)}\" width=\"${w}\" height=\"${h}\" style=\"width:${w}px;max-width:100%;height:auto;border:1px solid rgba(128,128,128,.4);border-radius:8px;touch-action:none\"></canvas>`;
   }
   function _color(c) {
-    return _cv_do(((__a0) => (__a0)), "color", [c]);
+    return _cv_do((__a0) => (__a0), "color", [c]);
   }
   function _line_width(n) {
-    return _cv_do(((__a0) => (__a0)), "lw", [n]);
+    return _cv_do((__a0) => (__a0), "lw", [n]);
   }
   function _font(size) {
-    return _cv_do(((__a0) => (__a0)), "font", [size]);
+    return _cv_do((__a0) => (__a0), "font", [size]);
   }
   function _line(x1, y1, x2, y2) {
-    return _cv_do(((__a0) => (__a0)), "line", [x1, y1, x2, y2]);
+    return _cv_do((__a0) => (__a0), "line", [x1, y1, x2, y2]);
   }
   function _rect(x, y, rw, rh) {
-    return _cv_do(((__a0) => (__a0)), "rect", [x, y, rw, rh]);
+    return _cv_do((__a0) => (__a0), "rect", [x, y, rw, rh]);
   }
   function _frame(x, y, rw, rh) {
-    return _cv_do(((__a0) => (__a0)), "frame", [x, y, rw, rh]);
+    return _cv_do((__a0) => (__a0), "frame", [x, y, rw, rh]);
   }
   function _circle(x, y, r) {
-    return _cv_do(((__a0) => (__a0)), "circle", [x, y, r]);
+    return _cv_do((__a0) => (__a0), "circle", [x, y, r]);
   }
   function _ring(x, y, r) {
-    return _cv_do(((__a0) => (__a0)), "ring", [x, y, r]);
+    return _cv_do((__a0) => (__a0), "ring", [x, y, r]);
   }
   function _text(x, y, s) {
-    return _cv_do(((__a0) => (__a0)), "text", [x, y, s]);
+    return _cv_do((__a0) => (__a0), "text", [x, y, s]);
   }
   function _poly(points) {
-    return _cv_do(((__a0) => (__a0)), "poly", [points]);
+    return _cv_do((__a0) => (__a0), "poly", [points]);
   }
   function _clear() {
-    return _cv_do(((__a0) => (__a0)), "clear", []);
+    return _cv_do((__a0) => (__a0), "clear", []);
   }
   function _draw(js) {
-    return _cv_do(((__a0) => (__a0)), "draw", [js]);
+    return _cv_do((__a0) => (__a0), "draw", [js]);
   }
   function _on_mouse(fn_cb) {
-    return _cv_on_mouse(((__a0) => (__a0)), fn_cb);
+    return _cv_on_mouse((__a0) => (__a0), fn_cb);
   }
   return { to_html: to_html, color: _color, line_width: _line_width, font: _font, line: _line, rect: _rect, frame: _frame, circle: _circle, ring: _ring, text: _text, poly: _poly, erase: _clear, draw: _draw, on_mouse: _on_mouse, __str__: () => to_html() };
 }
@@ -624,8 +808,8 @@ function canvas(id, w, h) {
 async function _win_open(info) {
   let p, page, close_line, htv_path;
   p = info["proc"];
-  if ((p !== false)) {
-    if ((!(p.exitCode !== null))) {
+  if (p !== false) {
+    if (!(p.exitCode !== null)) {
       return true;
     }
   }
@@ -637,7 +821,7 @@ async function _win_open(info) {
       return "";
     }
   })();
-  htv_path = (await (async()=>{const{tmpdir}=await import('node:os');const{join}=await import('node:path');return join(tmpdir(), ("vspk_"??'')+Math.random().toString(36).slice(2)+(".htv"??''))})());
+  htv_path = await (async()=>{const{tmpdir}=await import('node:os');const{join}=await import('node:path');return join(tmpdir(), ("vspk_"??'')+Math.random().toString(36).slice(2)+(".htv"??''))})();
   (await Bun.write(htv_path, ((__v) => (typeof __v === 'string' || ArrayBuffer.isView(__v) || __v instanceof ArrayBuffer || __v instanceof Blob) ? __v : String(__v))(`title: ${info["title"]}\nwidth: ${info["w"]}\nheight: ${info["h"]}\ndevtools: true\n${_icon_line}${close_line}\n${page}`)));
   info["htv"] = htv_path;
   info["proc"] = (Bun.spawn([(await find_vspk()), htv_path], { stdin: 'inherit', stdout: 'inherit', stderr: 'inherit' }));
@@ -652,7 +836,7 @@ async function _win_show(info) {
   if (_running) {
     (await _win_open(info));
   }
-  if ((!_running)) {
+  if (!_running) {
     info["want"] = true;
   }
   return true;
@@ -666,10 +850,10 @@ function _win_on_close(info, fn_cb) {
   on_event(ev, (d) => {
     let r;
     r = _safe_true(fn_cb);
-    if ((r === false)) {
+    if (r === false) {
       _win_eval(info, "__vspk.cancelClose()");
     }
-    if ((r !== false)) {
+    if (r !== false) {
       _win_eval(info, "__vspk.confirmClose()");
     }
   });
@@ -679,7 +863,7 @@ function _win_on_close(info, fn_cb) {
 function _win_add(info, w1, w2, w3, w4) {
   let w;
   for (w of [w1, w2, w3, w4]) {
-    if ((w !== "")) {
+    if (w !== "") {
       info["widgets"].push(`${w}`);
     }
   }
@@ -688,14 +872,14 @@ function _win_add(info, w1, w2, w3, w4) {
 
 function window(title, width = 480, height = 360) {
   let info;
-  _win_count = (_win_count + 1);
+  _win_count = _win_count + 1;
   info = { id: `w${_win_count}`, title: title, w: width, h: height, widgets: [], proc: false, htv: "", want: false, close_on: false, close_js: "" };
   _wins.push(info);
   function _add(a = "", b = "", c = "", d = "") {
     return _win_add(info, a, b, c, d);
   }
   async function _show() {
-    return (await _win_show(info));
+    return await _win_show(info);
   }
   function _close() {
     return _win_eval(info, "__vspk.close()");
@@ -718,17 +902,17 @@ function window(title, width = 480, height = 360) {
 function _win_is_open(info) {
   let p;
   p = info["proc"];
-  if ((p === false)) {
+  if (p === false) {
     return false;
   }
-  return (!(p.exitCode !== null));
+  return !(p.exitCode !== null);
 }
 
 function MenuItem(label, js = "", shortcut = "") {
   let click, kbd;
   click = js.replaceAll("\"", "&quot;");
   kbd = (() => {
-    if ((shortcut !== "")) {
+    if (shortcut !== "") {
       return `<kbd>${html_escape(shortcut)}</kbd>`;
     } else {
       return "";
@@ -768,30 +952,30 @@ function _page_html(title, body_html, eval_ev, is_main, child_close_js) {
   let state_json, key_js, main_close_js, close_js, timers_js, cv_js, accent_style;
   state_json = JSON.stringify(_states);
   key_js = (() => {
-    if ((_key_on && is_main)) {
+    if (_key_on && is_main) {
       return `document.addEventListener('keydown',function(e){${_post_js(_ev("k"), "JSON.stringify({key:e.key,code:e.code,ctrl:e.ctrlKey,shift:e.shiftKey,alt:e.altKey,meta:e.metaKey})")}});`;
     } else {
       return "";
     }
   })();
   main_close_js = (() => {
-    if ((_close_on && is_main)) {
+    if (_close_on && is_main) {
       return `window.addEventListener('vspk:closeRequested',function(){${_post_js(_ev("c"), "'{}'")}});`;
     } else {
       return "";
     }
   })();
-  close_js = (main_close_js + child_close_js);
+  close_js = main_close_js + child_close_js;
   timers_js = (() => {
     if (is_main) {
-      return (_timers.join(";") + ";");
+      return _timers.join(";") + ";";
     } else {
       return "";
     }
   })();
   cv_js = `${_cv_ids.map((i) => _cv_logs[i]).join("")}${_cv_mouse_js}`;
   accent_style = (() => {
-    if ((_accent !== "")) {
+    if (_accent !== "") {
       return `<style>:root{--sz-accent:${_accent};} .sz-btn-filled{background:${_accent};border-color:${_accent};}</style>`;
     } else {
       return "";
@@ -896,14 +1080,14 @@ function App(title, width = 1024, height = 768, theme = "light", accent = "") {
   _height = height;
   _theme = theme;
   _accent = accent;
-  _port = (Math.floor((Math.random() * 10000)) + 20000);
-  _token = ((String(Math.trunc(Number((Math.random() * 1000000000)))) + String(Math.trunc(Number((Math.random() * 1000000000))))) + String(Math.trunc(Number((Math.random() * 1000000000)))));
+  _port = Math.floor(Math.random() * 10000) + 20000;
+  _token = String(Math.trunc(Number(Math.random() * 1000000000))) + String(Math.trunc(Number(Math.random() * 1000000000))) + String(Math.trunc(Number(Math.random() * 1000000000)));
   return { state: state, canvas: canvas, window: window, add: add, on_click: on_click, on_event: on_event, eval_js: eval_js, run: run, on_key: on_key, on_close: on_close, pick_file: pick_file, save_file: save_file, pick_folder: pick_folder, run_every: run_every, run_after: run_after, set_title: set_title, notify: notify, copy_text: copy_text, quit: quit, message: message, confirm: confirm, prompt: prompt, table_set: table_set, table_set_cols: table_set_cols, table_select: table_select, table_sort: table_sort, tree_set: tree_set };
 }
 
 async function run() {
-  let _vspk_exe, html, icon_dirs, icon_names, icon_path, dir, name, candidate, from_env, i, icon_line, close_line, htv_content, htv_path, proc, info, msg, data, is_value, key, src, hp;
-  _vspk_exe = (await find_vspk());
+  let _vspk_exe, html, icon_dirs, icon_names, icon_path, dir, name, candidate, from_env, i, icon_line, shown, close_line, htv_content, htv_path, proc, info, msg, data, is_value, key, src, hp;
+  _vspk_exe = await find_vspk();
   ((__p) => { const __q = (globalThis.__vspkQ ??= []); const __c = (globalThis.__vspkC ??= new Set()); const __enc = new TextEncoder(); const __cors = { 'Access-Control-Allow-Origin': '*' };
       globalThis.__vspkSrv = Bun.serve({ port: Number(__p), hostname: '0.0.0.0', idleTimeout: 0, async fetch(req) {
         const u = new URL(req.url);
@@ -919,26 +1103,26 @@ async function run() {
   icon_path = "";
   for (dir of icon_dirs) {
     for (name of icon_names) {
-      if (((icon_path === "") && (dir !== ""))) {
+      if (icon_path === "" && dir !== "") {
         candidate = (await import('node:path')).join(dir, name);
-        if ((await Bun.file(candidate).exists())) {
+        if (await Bun.file(candidate).exists()) {
           icon_path = candidate;
         }
       }
     }
   }
-  if ((icon_path === "")) {
-    from_env = (process.env["VSPK_DEFAULT_ICON"] ?? "");
-    if (((from_env !== "") && (await Bun.file(from_env).exists()))) {
+  if (icon_path === "") {
+    from_env = process.env["VSPK_DEFAULT_ICON"] ?? "";
+    if (from_env !== "" && (await Bun.file(from_env).exists())) {
       icon_path = from_env;
     }
   }
-  if ((icon_path === "")) {
+  if (icon_path === "") {
     dir = import.meta.dir;
     for (i of [0, 1, 2, 3, 4, 5, 6, 7]) {
-      if ((icon_path === "")) {
+      if (icon_path === "") {
         candidate = (await import('node:path')).join(dir, "vspk_default.ico");
-        if ((await Bun.file(candidate).exists())) {
+        if (await Bun.file(candidate).exists()) {
           icon_path = candidate;
         }
         dir = (await import('node:path')).dirname(dir);
@@ -946,12 +1130,23 @@ async function run() {
     }
   }
   icon_line = (() => {
-    if ((icon_path !== "")) {
+    if (icon_path !== "") {
       return `icon: ${icon_path}\n`;
     } else {
       return "";
     }
   })();
+  if ((process.env["VSPK_DEBUG"] ?? "") !== "") {
+    shown = (() => {
+      if (icon_path !== "") {
+        return icon_path;
+      } else {
+        return "(ninguno: icono interno de vspk.exe)";
+      }
+    })();
+    __out(`[vspk] icono elegido: ${shown}`);
+    __out(`[vspk] buscado en: ${icon_dirs[0]} | ${icon_dirs[1]}`);
+  }
   close_line = (() => {
     if (_close_on) {
       return "on_close: confirm\n";
@@ -961,19 +1156,19 @@ async function run() {
   })();
   htv_content = `title: ${_title}\nwidth: ${_width}\nheight: ${_height}\ndevtools: true\n${icon_line}${close_line}\n${html}`;
   _icon_line = `${icon_line}`;
-  htv_path = (await (async()=>{const{tmpdir}=await import('node:os');const{join}=await import('node:path');return join(tmpdir(), ("vspk_"??'')+Math.random().toString(36).slice(2)+(".htv"??''))})());
+  htv_path = await (async()=>{const{tmpdir}=await import('node:os');const{join}=await import('node:path');return join(tmpdir(), ("vspk_"??'')+Math.random().toString(36).slice(2)+(".htv"??''))})();
   (await Bun.write(htv_path, ((__v) => (typeof __v === 'string' || ArrayBuffer.isView(__v) || __v instanceof ArrayBuffer || __v instanceof Blob) ? __v : String(__v))(htv_content)));
-  proc = (Bun.spawn([_vspk_exe, htv_path], { stdin: 'inherit', stdout: 'inherit', stderr: 'inherit' }));
+  proc = Bun.spawn([_vspk_exe, htv_path], { stdin: 'inherit', stdout: 'inherit', stderr: 'inherit' });
   _running = true;
   for (info of _wins) {
     if (info["want"]) {
       (await _win_open(info));
     }
   }
-  while ((!(proc.exitCode !== null))) {
-    msg = ((globalThis.__vspkQ ??= []).shift() ?? null);
-    if ((msg !== null)) {
-      if ((msg.kind === "cb")) {
+  while (!(proc.exitCode !== null)) {
+    msg = (globalThis.__vspkQ ??= []).shift() ?? null;
+    if (msg !== null) {
+      if (msg.kind === "cb") {
         if (((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(_callbacks, msg.id)) {
           try {
             (_callbacks[msg.id])();
@@ -981,19 +1176,19 @@ async function run() {
 
           }
         }
-      } else if ((msg.kind === "event")) {
+      } else if (msg.kind === "event") {
         data = (() => {
           try {
-            return (JSON.parse(msg.body));
+            return JSON.parse(msg.body);
           } catch (_e) {
             return null;
           }
         })();
-        is_value = (msg.name === _ev("v"));
-        if ((is_value && (data !== null))) {
+        is_value = msg.name === _ev("v");
+        if (is_value && data !== null) {
           key = String(data["n"]);
           _states[key] = data["v"];
-          if (((typeof _wins === 'string' || Array.isArray(_wins) ? _wins.length : _wins == null ? 0 : typeof _wins === 'object' ? Object.keys(_wins).length : String(_wins).length) > 0)) {
+          if ((typeof _wins === 'string' || Array.isArray(_wins) ? _wins.length : _wins == null ? 0 : typeof _wins === 'object' ? Object.keys(_wins).length : String(_wins).length) > 0) {
             src = "";
             if (((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(data, "w")) {
               src = `${data["w"]}`;
@@ -1001,7 +1196,7 @@ async function run() {
             _push_sse("state", { name: key, value: data["v"], src: src });
           }
         }
-        if (((!is_value) && ((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(_events, msg.name))) {
+        if ((!is_value) && ((__o, __k) => __o != null && typeof __o === 'object' && !Array.isArray(__o) && Object.hasOwn(__o, __k))(_events, msg.name)) {
           try {
             (_events[msg.name])(data);
           } catch (_e) {
@@ -1013,171 +1208,188 @@ async function run() {
     (await Bun.sleep(15));
   }
   for (info of _wins) {
-    if ((_win_is_open(info) === true)) {
+    if (_win_is_open(info) === true) {
       _win_eval(info, "__vspk.close()");
     }
   }
   (await Bun.sleep(300));
   for (info of _wins) {
     hp = `${info["htv"]}`;
-    if ((hp !== "")) {
+    if (hp !== "") {
       (await (async()=>{const{unlink}=await import('node:fs/promises');await unlink(hp)})());
     }
   }
-  return (await (async()=>{const{unlink}=await import('node:fs/promises');await unlink(htv_path)})());
+  return await (async()=>{const{unlink}=await import('node:fs/promises');await unlink(htv_path)})();
 }
 
-var SPORK_CSS = "spork.css";
-
-var SPORK_JS = "spork.js";
-
-var SPORK_CSS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css";
-
-var SPORK_JS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js";
-
-var _states = {  };
-
-var _widgets = [];
-
-var _callbacks = {  };
-
-var _events = {  };
-
-var _cb_count = 0;
-
-var _port = 0;
-
-var _title = "";
-
-var _width = 1024;
-
-var _height = 768;
-
-var _theme = "light";
-
-var _accent = "";
-
-var _token = "";
-
-var _key_on = false;
-
-var _close_on = false;
-
-var _running = false;
-
-var _icon_line = "";
-
-var _timers = [];
-
-var _cv_ids = [];
-
-var _wins = [];
-
-var _win_count = 0;
-
-var _cv_logs = {  };
-
-var _cv_mouse_js = "";
-
-var _vt_count = 0;
-
-var gui = App("Demo vspk", 520, 720);
-
-var n = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("n", 0) : state(gui, "n", 0));
-
-var m = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("m", 0) : state(gui, "m", 0));
-
-var pct = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("pct", 0) : state(gui, "pct", 0));
-
-var nombre = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("nombre", "") : state(gui, "nombre", ""));
-
-var acepto = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("acepto", false) : state(gui, "acepto", false));
-
-var color = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("color", "azul") : state(gui, "color", "azul"));
-
-var log = ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.state === 'function') ? gui.state("log", "—") : state(gui, "log", "—"));
-
-((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.add === 'function') ? gui.add(Card(H2("Demo vspk"), H4("1. Contador en Spork (cada clic va al puente)"), Row(Button("-", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  n.dec();
-  return log.set("n bajó");
-}) : on_click(gui, () => {
-  n.dec();
-  return log.set("n bajó");
-})), "outlined"), H3(n), Button("+", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  n.inc();
-  return log.set("n subió");
-}) : on_click(gui, () => {
-  n.inc();
-  return log.set("n subió");
-})))), Hr(), H4("2. Contador solo JS (sin puente, debe ser instantáneo)"), Row(Button("-", m.js_dec(), "outlined"), H3(m), Button("+", m.js_inc())), Hr(), H4("3. Input enlazado"), Input("Escribe tu nombre", nombre), P(nombre), Hr(), H4("4. Checkbox y Select"), Checkbox("Acepto las condiciones", acepto), Select([["azul", "Azul"], ["verde", "Verde"], ["rojo", "Rojo"]], color), P(color), Hr(), H4("5. Progreso (Spork actualiza la barra)"), Progress(pct), Row(Button("+10%", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  if ((pct.get() < 100)) {
-    pct.set((pct.get() + 10));
+function format_weather_icon(ico) {
+  let clean;
+  if (ico.startsWith("http")) {
+    return ico;
+  } else {
+    clean = ico.trim().replaceAll(".svg", "").replaceAll(".png", "");
+    return `https://v5i.tutiempo.net/wi/01/50/${clean}.png`;
   }
-  return log.set(`progreso ${pct.get()}`);
-}) : on_click(gui, () => {
-  if ((pct.get() < 100)) {
-    pct.set((pct.get() + 10));
-  }
-  return log.set(`progreso ${pct.get()}`);
-}))), Button("Reiniciar", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  pct.set(0);
-  return log.set("reiniciado");
-}) : on_click(gui, () => {
-  pct.set(0);
-  return log.set("reiniciado");
-})), "outlined")), Hr(), H4("6. Variantes y alertas"), Row(Chip("normal"), Chip("primario", true), Badge("badge")), Alert("Todo correcto", "success"), Alert("Cuidado", "warning"), Row(Button("Texto", "", "text"), Button("Peligro", "", "danger"), Button("Pequeño", "", "filled", "sm")), Hr(), H4("7. eval_js desde Spork"), Row(Button("Teñir fondo", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = '#fff3cd'") : eval_js(gui, "document.body.style.background = '#fff3cd'"));
-  return log.set("fondo teñido desde Spork");
-}) : on_click(gui, () => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = '#fff3cd'") : eval_js(gui, "document.body.style.background = '#fff3cd'"));
-  return log.set("fondo teñido desde Spork");
-}))), Button("Quitar", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = ''") : eval_js(gui, "document.body.style.background = ''"));
-  return log.set("fondo restaurado");
-}) : on_click(gui, () => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = ''") : eval_js(gui, "document.body.style.background = ''"));
-  return log.set("fondo restaurado");
-})), "outlined")), P(log))) : add(gui, Card(H2("Demo vspk"), H4("1. Contador en Spork (cada clic va al puente)"), Row(Button("-", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  n.dec();
-  return log.set("n bajó");
-}) : on_click(gui, () => {
-  n.dec();
-  return log.set("n bajó");
-})), "outlined"), H3(n), Button("+", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  n.inc();
-  return log.set("n subió");
-}) : on_click(gui, () => {
-  n.inc();
-  return log.set("n subió");
-})))), Hr(), H4("2. Contador solo JS (sin puente, debe ser instantáneo)"), Row(Button("-", m.js_dec(), "outlined"), H3(m), Button("+", m.js_inc())), Hr(), H4("3. Input enlazado"), Input("Escribe tu nombre", nombre), P(nombre), Hr(), H4("4. Checkbox y Select"), Checkbox("Acepto las condiciones", acepto), Select([["azul", "Azul"], ["verde", "Verde"], ["rojo", "Rojo"]], color), P(color), Hr(), H4("5. Progreso (Spork actualiza la barra)"), Progress(pct), Row(Button("+10%", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  if ((pct.get() < 100)) {
-    pct.set((pct.get() + 10));
-  }
-  return log.set(`progreso ${pct.get()}`);
-}) : on_click(gui, () => {
-  if ((pct.get() < 100)) {
-    pct.set((pct.get() + 10));
-  }
-  return log.set(`progreso ${pct.get()}`);
-}))), Button("Reiniciar", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  pct.set(0);
-  return log.set("reiniciado");
-}) : on_click(gui, () => {
-  pct.set(0);
-  return log.set("reiniciado");
-})), "outlined")), Hr(), H4("6. Variantes y alertas"), Row(Chip("normal"), Chip("primario", true), Badge("badge")), Alert("Todo correcto", "success"), Alert("Cuidado", "warning"), Row(Button("Texto", "", "text"), Button("Peligro", "", "danger"), Button("Pequeño", "", "filled", "sm")), Hr(), H4("7. eval_js desde Spork"), Row(Button("Teñir fondo", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = '#fff3cd'") : eval_js(gui, "document.body.style.background = '#fff3cd'"));
-  return log.set("fondo teñido desde Spork");
-}) : on_click(gui, () => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = '#fff3cd'") : eval_js(gui, "document.body.style.background = '#fff3cd'"));
-  return log.set("fondo teñido desde Spork");
-}))), Button("Quitar", ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.on_click === 'function') ? gui.on_click(() => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = ''") : eval_js(gui, "document.body.style.background = ''"));
-  return log.set("fondo restaurado");
-}) : on_click(gui, () => {
-  ((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.eval_js === 'function') ? gui.eval_js("document.body.style.background = ''") : eval_js(gui, "document.body.style.background = ''"));
-  return log.set("fondo restaurado");
-})), "outlined")), P(log))));
+}
 
-((typeof gui === 'object' && gui !== null && !Array.isArray(gui) && typeof gui.run === 'function') ? (await gui.run()) : (await run(gui)));
+function format_moon_icon(ico) {
+  let clean;
+  if (ico.startsWith("http")) {
+    return ico;
+  } else {
+    clean = ico.trim().replaceAll(".svg", "").replaceAll(".png", "");
+    return `https://v5i.tutiempo.net/wmi/01/${clean}.png`;
+  }
+}
+
+function Img(id, alt) {
+  return `<img id=\"${id}\" alt=\"${html_escape(alt)}\" src=\"\" style=\"width:48px;height:48px;object-fit:contain;display:block;margin:8px auto;\">`;
+}
+
+function ImgScript() {
+  return `<script>
+  (function() {
+    function loadImg(id, url) {
+      if (!url) return;
+      var el = document.getElementById(id);
+      if (!el || el.dataset.loaded === url) return;
+      el.dataset.loaded = url;
+      function tryLoad() {
+        if (typeof __vspk !== 'undefined') {
+          el.src = url;
+        } else {
+          setTimeout(tryLoad, 100);
+        }
+      }
+      tryLoad();
+    }
+
+    var _orig = window.__set;
+    window.__set = function(k, v) {
+      if (_orig) _orig(k, v);
+      if (k === 'img_dia')  loadImg('img_dia',  v);
+      if (k === 'img_luna') loadImg('img_luna', v);
+    };
+
+    document.addEventListener('DOMContentLoaded', function() {
+      var check = setInterval(function() {
+        var s = window.__state || {};
+        if (s.img_dia || s.img_luna) {
+          clearInterval(check);
+          loadImg('img_dia',  s.img_dia);
+          loadImg('img_luna', s.img_luna);
+        }
+      }, 100);
+    });
+  })();
+  </script>`;
+}
+
+async function load_weather() {
+  let text, dia_section, hora_section, localidad, dia, temp_actual;
+  try {
+    text = await (async()=>{const __r=await fetch(XML_URL);if(!__r.ok)throw new Error('http_get '+__r.status+': '+await __r.text().catch(()=>''));return __r.text();})();
+    dia_section = ((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>[\\s\\S]*?<\\/' + __t + '>')); return __m ? __m[0] : ""; })(text, "dia");
+    hora_section = ((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>[\\s\\S]*?<\\/' + __t + '>')); return __m ? __m[0] : ""; })(text, "hora");
+    localidad = ((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>[\\s\\S]*?<\\/' + __t + '>')); return __m ? __m[0] : ""; })(text, "localidad"), "nombre");
+    if (dia_section === "") {
+      return { ok: false, localidad: "", dia: null, temp_actual: "N/A", error: "Sin datos de pronóstico" };
+    } else {
+      dia = { fecha_larga: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "fecha_larga")), temp_maxima: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "temp_maxima")), temp_minima: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "temp_minima")), humedad: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "humedad")), viento: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "viento")), dir_viento: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "dir_viento")), icono: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "icono")), ico_fase_luna: (((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(dia_section, "ico_fase_luna")) };
+      temp_actual = (() => {
+        if (hora_section !== "") {
+          return ((__s, __t) => { const __m = String(__s).match(new RegExp('<' + __t + '(?:\\s[^>]*)?>([\\s\\S]*?)<\\/' + __t + '>')); return __m ? __m[1].trim() : "N/A"; })(hora_section, "temperatura");
+        } else {
+          return "N/A";
+        }
+      })();
+      return { ok: true, localidad: localidad, dia: dia, temp_actual: temp_actual };
+    }
+  } catch (err) {
+    return { ok: false, localidad: "", dia: null, temp_actual: "N/A", error: `${err}` };
+  }
+}
+
+function update_ui(data) {
+  let d;
+  if (data.dia === null) {
+    return;
+  }
+  d = data.dia;
+  ciudad.set(data.localidad);
+  fecha.set((() => {
+    if (d.fecha_larga !== "N/A") {
+      return d.fecha_larga;
+    } else {
+      return "--";
+    }
+  })());
+  temp.set(`Temperatura actual: ${data.temp_actual} °C`);
+  maxmin.set(`${d.temp_maxima} °C  |  ${d.temp_minima} °C`);
+  humedad.set(`Humedad: ${d.humedad}%`);
+  viento.set(`Viento: ${d.viento} km/h - ${d.dir_viento}`);
+  img_dia.set(format_weather_icon(d.icono));
+  return img_luna.set(format_moon_icon(d.ico_fase_luna));
+}
+
+async function fetch_weather() {
+  let data;
+  data = await load_weather();
+  if (!data.ok) {
+    ciudad.set(`Error: ${data.error}`);
+    return;
+  }
+  return update_ui(data);
+}
+
+const SPORK_CSS = "spork.css";
+const SPORK_JS = "spork.js";
+const SPORK_CSS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css";
+const SPORK_JS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js";
+const _states = {  };
+const _widgets = [];
+const _callbacks = {  };
+const _events = {  };
+let _cb_count = 0;
+let _port = 0;
+let _title = "";
+let _width = 1024;
+let _height = 768;
+let _theme = "light";
+let _accent = "";
+let _token = "";
+let _key_on = false;
+let _close_on = false;
+let _running = false;
+let _icon_line = "";
+const _timers = [];
+const _cv_ids = [];
+const _wins = [];
+let _win_count = 0;
+const _cv_logs = {  };
+let _cv_mouse_js = "";
+let _on_error = null;
+const _streams = {  };
+let _stream_on = false;
+let _vt_count = 0;
+const XML_URL = "http://xml.tutiempo.net/xml/3589.xml";
+const app = App("Pronóstico del Tiempo - Málaga", 450, 560, "light", "#0284c7");
+const ciudad = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("ciudad", "Cargando clima...") : state(app, "ciudad", "Cargando clima...");
+const fecha = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("fecha", "--") : state(app, "fecha", "--");
+const temp = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("temp", "--") : state(app, "temp", "--");
+const maxmin = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("maxmin", "-- | --") : state(app, "maxmin", "-- | --");
+const humedad = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("humedad", "Humedad: --") : state(app, "humedad", "Humedad: --");
+const viento = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("viento", "Viento: --") : state(app, "viento", "Viento: --");
+const img_dia = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("img_dia", "") : state(app, "img_dia", "");
+const img_luna = (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.state === 'function') ? app.state("img_luna", "") : state(app, "img_luna", "");
+const data0 = await load_weather();
+
+if (data0.ok) {
+  update_ui(data0);
+} else {
+  ciudad.set(`Error: ${data0.error}`);
+}
+
+((typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.add === 'function') ? app.add(Col(H1(ciudad), P(fecha), Hr(), Card(H2(temp), P(maxmin), Row(P(humedad), P(viento))), Hr(), H3("Indicadores"), Row(Card(P("🌙 Fase Lunar"), Img("img_luna", "Fase Lunar")), Card(P("☀ Día"), Img("img_dia", "Icono del Día"))), ImgScript(), Hr(), Button("Actualizar Pronóstico", (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.on_click === 'function') ? app.on_click(async () => (await fetch_weather())) : on_click(app, async () => (await fetch_weather())), "filled"))) : add(app, Col(H1(ciudad), P(fecha), Hr(), Card(H2(temp), P(maxmin), Row(P(humedad), P(viento))), Hr(), H3("Indicadores"), Row(Card(P("🌙 Fase Lunar"), Img("img_luna", "Fase Lunar")), Card(P("☀ Día"), Img("img_dia", "Icono del Día"))), ImgScript(), Hr(), Button("Actualizar Pronóstico", (typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.on_click === 'function') ? app.on_click(async () => (await fetch_weather())) : on_click(app, async () => (await fetch_weather())), "filled"))));
+((typeof app === 'object' && app !== null && !Array.isArray(app) && typeof app.run === 'function') ? (await app.run()) : (await run(app)));
 

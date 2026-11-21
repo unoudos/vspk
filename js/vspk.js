@@ -30,18 +30,20 @@ const PIPE       = IS_WINDOWS ? "\\\\.\\pipe\\vspk" : "/tmp/vspk.sock"
 
 // ── IPC (con vspk.exe) ────────────────────────────────────────────────────────
 
-function ipcSend(msg) {
+function ipcSend(msg, timeoutMs = 2000) {
     return new Promise((resolve) => {
         const sock = net.createConnection({ path: PIPE })
-        let buf = ""
+        let buf = "", done = false
+        const finish = (v) => { if (done) return; done = true; clearTimeout(timer); try { sock.destroy() } catch {} resolve(v) }
+        const timer = setTimeout(() => finish(null), timeoutMs)   // vspk colgado: no esperar eternamente
         sock.on("data", (chunk) => {
             buf += chunk.toString()
             if (buf.includes("\n")) {
-                try { resolve(JSON.parse(buf.trim())) } catch { resolve(null) }
-                sock.destroy()
+                try { finish(JSON.parse(buf.trim())) } catch { finish(null) }
             }
         })
-        sock.on("error", () => resolve(null))
+        sock.on("error", () => finish(null))
+        sock.on("close", () => finish(null))                       // cerró sin responder
         sock.on("connect", () => {
             sock.write(JSON.stringify(msg) + "\n")
         })
@@ -56,6 +58,33 @@ async function waitForSocket(timeout = 5000) {
         await Bun.sleep(50)
     }
     return false
+}
+
+// ── Gestión de ventanas por IPC (App / ChildWindow) ───────────────────────────
+// vspk asigna el id de ventana al abrirla; lo averiguamos comparando `list` antes y después de lanzar.
+async function winIds() {
+    const r = await ipcSend({ cmd: "list" })
+    return new Set((r?.windows ?? []).map(w => w.id))   // si el pipe aún no existe → vacío
+}
+async function resolveWinId(before, htv, timeout = 2000) {
+    const base = path.basename(htv)
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+        const r = await ipcSend({ cmd: "list" })
+        const fresh = (r?.windows ?? []).filter(w => !before.has(w.id))
+        if (fresh.length) {
+            // Si vspk informa del fichero, preferimos la coincidencia exacta; si no, la ventana nueva con mayor id.
+            const m = fresh.find(w => typeof w.file === "string" && w.file.endsWith(base))
+            return (m ?? fresh.reduce((a, b) => (b.id > a.id ? b : a))).id
+        }
+        await Bun.sleep(50)
+    }
+    return 0
+}
+async function winCmd(id, cmd, extra = {}) {
+    if (!id) return false
+    const r = await ipcSend({ cmd, id, ...extra })
+    return !!r?.ok
 }
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
@@ -388,7 +417,7 @@ const MENU_A = "<style>.sz-menubar{position:fixed;top:0;left:0;right:0;z-index:1
 const MENU_B = "</div><div class=\"sz-menubar-space\"></div><script>(function(){if(window.__menu)return;window.__menu=1;var bar=document.querySelector('.sz-menubar');function menus(){return bar.querySelectorAll(':scope > .sz-menu')}window.__vspk_menu_click=function(id){var p=id.split('.');var m=menus()[+p[0]];if(m)m.querySelector('.sz-menu-list').children[+p[1]].click()};window.__vspk_menu_ok=function(){document.documentElement.classList.add('sz-native')};if(bar&&window.ipc&&window.__vspk_native_menu_ok){var ms=[];Array.prototype.forEach.call(menus(),function(m,mi){var items=[];Array.prototype.forEach.call(m.querySelector('.sz-menu-list').children,function(c,ii){if(c.classList.contains('sz-menu-sep'))items.push({sep:true});else items.push({id:mi+'.'+ii,label:(c.querySelector('span')||c).textContent,accel:c.getAttribute('data-accel')||''})});ms.push({label:m.querySelector('.sz-menu-title').textContent,items:items})});window.ipc.postMessage(JSON.stringify({cmd:'setMenu',menu:ms}))}function closeAll(except){document.querySelectorAll('.sz-menu.sz-open').forEach(function(m){if(m!==except)m.classList.remove('sz-open')})}document.addEventListener('click',function(e){var t=e.target.closest?e.target.closest('.sz-menu-title'):null;closeAll(t?t.parentNode:null);if(t)t.parentNode.classList.toggle('sz-open');var it=e.target.closest?e.target.closest('.sz-menu-item'):null;if(it)closeAll(null)});document.addEventListener('mouseover',function(e){var t=e.target.closest?e.target.closest('.sz-menu-title'):null;var o=document.querySelector('.sz-menu.sz-open');if(t&&o&&o!==t.parentNode){closeAll(t.parentNode);t.parentNode.classList.add('sz-open')}});document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeAll(null);return}if(document.documentElement.classList.contains('sz-native')&&!/Win/.test(navigator.platform))return;var k=(e.ctrlKey?'ctrl+':'')+(e.shiftKey?'shift+':'')+(e.altKey?'alt+':'')+e.key.toLowerCase();var items=document.querySelectorAll('.sz-menu-item[data-accel]');for(var i=0;i<items.length;i++){var a=items[i].getAttribute('data-accel');if(a&&a.toLowerCase()===k){e.preventDefault();items[i].click();return}}})})();</script>"
 
 export const MenuItem = (label, onclick = "", shortcut = "") =>
-    new Raw(`<button type="button" class="sz-menu-item" onclick="${String(onclick).replaceAll('"', "&quot;")}" data-accel="${esc(shortcut)}"><span>${esc(label)}</span>${shortcut ? `<kbd>${esc(shortcut)}</kbd>` : ""}</button>`)
+    new Raw(`<button type="button" class="sz-menu-item" onclick="${esc(onclick)}" data-accel="${esc(shortcut)}"><span>${esc(label)}</span>${shortcut ? `<kbd>${esc(shortcut)}</kbd>` : ""}</button>`)
 export const MenuSep = () => new Raw(`<div class="sz-menu-sep"></div>`)
 export const Menu = (title, ...items) =>
     new Raw(`<div class="sz-menu"><button type="button" class="sz-menu-title">${esc(title)}</button><div class="sz-menu-list">${items.map(i => i instanceof Widget ? i.render() : String(i)).join("")}</div></div>`)
@@ -405,6 +434,7 @@ class ChildWindow {
     constructor(app, id, title, width, height) {
         this._app = app; this.id = id; this.title = title; this.width = width; this.height = height
         this.widgets = []; this.proc = null; this.htv = ""; this.want = false; this.closeOn = false; this.closeJs = ""
+        this.winId = 0; this.idReady = null   // id de ventana de vspk (IPC)
     }
     add(...ws)       { this.widgets.push(...ws); return this }
     show()           { this._app._winShow(this); return this }
@@ -413,11 +443,17 @@ class ChildWindow {
     evalJs(code)     { this._app._winEval(this, code) }
     onClose(fn)      { this._app._winOnClose(this, fn); return this }
     isOpen()         { return this.proc !== null && this.proc.exitCode === null }
+    // Gestión por IPC; devuelven Promise<boolean> (false si no hay pipe o la ventana aún no está registrada)
+    async _cmd(cmd, extra) { await this.idReady; return winCmd(this.winId, cmd, extra) }
+    focus()          { return this._cmd("focus") }
+    move(x, y)       { return this._cmd("move", { x, y }) }
+    resize(w, h)     { return this._cmd("resize", { w, h }) }
+    snap(pos)        { return this._cmd("snap", { pos }) }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-const PAGE_JS = "window.__state = %STATE%;\nwindow.__win = %WIN%;\nwindow.__set = function(name, value) {\n  window.__state[name] = value;\n  document.querySelectorAll('[data-spork-text=\"' + name + '\"]').forEach(function(el) { el.textContent = value; });\n  document.querySelectorAll('[data-spork-bind=\"' + name + '\"]').forEach(function(el) {\n    if (el.type === 'checkbox') el.checked = !!value;\n    else if (el.value != value) el.value = value;\n  });\n  var ev = function(code) { return new Function('return (' + code + ')')(); };\n  document.querySelectorAll('[data-spork-style]').forEach(function(el) { try { Object.assign(el.style, ev(el.dataset.sporkStyle)); } catch(_) {} });\n  document.querySelectorAll('[data-spork-if]').forEach(function(el) { try { el.style.display = ev(el.dataset.sporkIf) ? '' : 'none'; } catch(_) {} });\n  document.querySelectorAll('[data-spork-class]').forEach(function(el) { try { var c = ev(el.dataset.sporkClass); if (typeof c === 'string') el.className = (el.dataset.sporkBase || (el.dataset.sporkBase = el.className)) + ' ' + c; } catch(_) {} });\n};\n// Valor que el usuario escribe/elige \u2192 a PHP (State::get() lo ve) y a los dem\u00e1s widgets enlazados.\nwindow.__sync = function(n, v) {\n  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n};\n(function() {\n  function onUser(e) {\n    var el = e.target && e.target.closest ? e.target.closest('[data-spork-bind]') : null;\n    if (!el) return;\n    var v = el.type === 'checkbox' ? el.checked : (el.type === 'range' || el.type === 'number') ? Number(el.value) : el.value;\n    var n = el.getAttribute('data-spork-bind');\n    window.__set(n, v);\n    window.__sync(n, v);\n  }\n  document.addEventListener('input', onUser);\n  document.addEventListener('change', onUser);\n})();\ndocument.addEventListener('click', function(e) {      // Tabs\n  var b = e.target.closest ? e.target.closest('[data-ttarget]') : null;\n  if (!b) return;\n  var g = b.dataset.ttarget, i = +b.dataset.tidx;\n  document.querySelectorAll('[data-tpanel]').forEach(function(p) { if (p.dataset.tpanel === g) p.classList.toggle('sz-active', +p.dataset.tidx === i); });\n  document.querySelectorAll('[data-ttarget]').forEach(function(x) { if (x.dataset.ttarget === g) x.classList.toggle('sz-active', +x.dataset.tidx === i); });\n});\nwindow.__toast = function(msg, v, ms) {\n  var c = document.getElementById('__vspk_toasts');\n  if (!c) { c = document.createElement('div'); c.className = 'sz-toast-container'; c.id = '__vspk_toasts'; document.body.appendChild(c); }\n  var t = document.createElement('div'); t.className = 'sz-toast' + (v ? ' sz-toast-' + v : ''); t.textContent = msg; c.appendChild(t);\n  setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { t.remove(); }, 300); }, ms || 3000);\n};\nwindow.__vspk_cmd = function(cmd, a, b) {\n  try {\n    if (cmd === 'close' || cmd === 'fullscreen') window.ipc && window.ipc.postMessage(JSON.stringify({cmd: cmd === 'close' ? 'close' : 'toggleFullscreen'}));\n    else if (cmd === 'setTitle' && window.__vspk_api) window.__vspk_api.setTitle(a);\n    else if (cmd === 'setTitle' && typeof __vspk !== 'undefined') __vspk.setTitle(a);\n    else if (cmd === 'notify' && typeof __vspk !== 'undefined') __vspk.notify(a, b);\n  } catch(err) { console.error(err); }\n};\nwindow.__cv = function(id, op, a) {\n  var c = document.getElementById(id); if (!c) return;\n  var x = c.getContext('2d');\n  if (op === 'clear') { x.clearRect(0, 0, c.width, c.height); }\n  else if (op === 'color') { x.fillStyle = a[0]; x.strokeStyle = a[0]; }\n  else if (op === 'lw') { x.lineWidth = a[0]; }\n  else if (op === 'font') { x.font = a[0] + 'px sans-serif'; }\n  else if (op === 'line') { x.beginPath(); x.moveTo(a[0], a[1]); x.lineTo(a[2], a[3]); x.stroke(); }\n  else if (op === 'rect') { x.fillRect(a[0], a[1], a[2], a[3]); }\n  else if (op === 'frame') { x.strokeRect(a[0], a[1], a[2], a[3]); }\n  else if (op === 'circle') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.fill(); }\n  else if (op === 'ring') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.stroke(); }\n  else if (op === 'text') { x.fillText(a[2], a[0], a[1]); }\n  else if (op === 'poly') { var p = a[0]; x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (var i = 1; i < p.length; i++) x.lineTo(p[i][0], p[i][1]); x.closePath(); x.fill(); }\n  else if (op === 'draw') { new Function('ctx', 'canvas', a[0])(x, c); }\n};\nObject.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });\n(function connectSSE() {\n  var es = new EventSource('http://127.0.0.1:%PORT%/events');\n  es.addEventListener('state', function(e) { var d = JSON.parse(e.data); if (d.src && d.src === window.__win) return; window.__set(d.name, d.value); });\n  [%EVALEV%, 'all'].forEach(function(n) { es.addEventListener(n, function(e) { try { (0, eval)(JSON.parse(e.data)); } catch(err) { console.error(err); } }); });\n  es.onerror = function() { es.close(); setTimeout(connectSSE, 1000); };\n})();"
+const PAGE_JS = "window.__state = %STATE%;\nwindow.__win = %WIN%;\nwindow.__set = function(name, value) {\n  window.__state[name] = value;\n  document.querySelectorAll('[data-spork-text=\"' + CSS.escape(name) + '\"]').forEach(function(el) { el.textContent = value; });\n  document.querySelectorAll('[data-spork-bind=\"' + CSS.escape(name) + '\"]').forEach(function(el) {\n    if (el.type === 'checkbox') el.checked = !!value;\n    else if (el.value != value) el.value = value;\n  });\n  var ev = function(code) { return new Function('return (' + code + ')')(); };\n  document.querySelectorAll('[data-spork-style]').forEach(function(el) { try { Object.assign(el.style, ev(el.dataset.sporkStyle)); } catch(_) {} });\n  document.querySelectorAll('[data-spork-if]').forEach(function(el) { try { el.style.display = ev(el.dataset.sporkIf) ? '' : 'none'; } catch(_) {} });\n  document.querySelectorAll('[data-spork-class]').forEach(function(el) { try { var c = ev(el.dataset.sporkClass); if (typeof c === 'string') el.className = (el.dataset.sporkBase || (el.dataset.sporkBase = el.className)) + ' ' + c; } catch(_) {} });\n};\n// Valor que el usuario escribe/elige \u2192 a PHP (State::get() lo ve) y a los dem\u00e1s widgets enlazados.\nwindow.__sync = function(n, v) {\n  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', keepalive: true, headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n};\n(function() {\n  function onUser(e) {\n    var el = e.target && e.target.closest ? e.target.closest('[data-spork-bind]') : null;\n    if (!el) return;\n    var v = el.type === 'checkbox' ? el.checked : (el.type === 'range' || el.type === 'number') ? Number(el.value) : el.value;\n    var n = el.getAttribute('data-spork-bind');\n    window.__set(n, v);\n    window.__sync(n, v);\n  }\n  document.addEventListener('input', onUser);\n  document.addEventListener('change', onUser);\n})();\ndocument.addEventListener('click', function(e) {      // Tabs\n  var b = e.target.closest ? e.target.closest('[data-ttarget]') : null;\n  if (!b) return;\n  var g = b.dataset.ttarget, i = +b.dataset.tidx;\n  document.querySelectorAll('[data-tpanel]').forEach(function(p) { if (p.dataset.tpanel === g) p.classList.toggle('sz-active', +p.dataset.tidx === i); });\n  document.querySelectorAll('[data-ttarget]').forEach(function(x) { if (x.dataset.ttarget === g) x.classList.toggle('sz-active', +x.dataset.tidx === i); });\n});\nwindow.__toast = function(msg, v, ms) {\n  var c = document.getElementById('__vspk_toasts');\n  if (!c) { c = document.createElement('div'); c.className = 'sz-toast-container'; c.id = '__vspk_toasts'; document.body.appendChild(c); }\n  var t = document.createElement('div'); t.className = 'sz-toast' + (v ? ' sz-toast-' + v : ''); t.textContent = msg; c.appendChild(t);\n  setTimeout(function() { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(function() { t.remove(); }, 300); }, ms || 3000);\n};\nwindow.__vspk_cmd = function(cmd, a, b) {\n  try {\n    if (cmd === 'close' || cmd === 'fullscreen') window.ipc && window.ipc.postMessage(JSON.stringify({cmd: cmd === 'close' ? 'close' : 'toggleFullscreen'}));\n    else if (cmd === 'setTitle' && window.__vspk_api) window.__vspk_api.setTitle(a);\n    else if (cmd === 'setTitle' && typeof __vspk !== 'undefined') __vspk.setTitle(a);\n    else if (cmd === 'notify' && typeof __vspk !== 'undefined') __vspk.notify(a, b);\n  } catch(err) { console.error(err); }\n};\nwindow.__cv = function(id, op, a) {\n  var c = document.getElementById(id); if (!c) return;\n  var x = c.getContext('2d');\n  if (op === 'clear') { x.clearRect(0, 0, c.width, c.height); }\n  else if (op === 'color') { x.fillStyle = a[0]; x.strokeStyle = a[0]; }\n  else if (op === 'lw') { x.lineWidth = a[0]; }\n  else if (op === 'font') { x.font = a[0] + 'px sans-serif'; }\n  else if (op === 'line') { x.beginPath(); x.moveTo(a[0], a[1]); x.lineTo(a[2], a[3]); x.stroke(); }\n  else if (op === 'rect') { x.fillRect(a[0], a[1], a[2], a[3]); }\n  else if (op === 'frame') { x.strokeRect(a[0], a[1], a[2], a[3]); }\n  else if (op === 'circle') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.fill(); }\n  else if (op === 'ring') { x.beginPath(); x.arc(a[0], a[1], a[2], 0, 6.283185307); x.stroke(); }\n  else if (op === 'text') { x.fillText(a[2], a[0], a[1]); }\n  else if (op === 'poly') { var p = a[0]; x.beginPath(); x.moveTo(p[0][0], p[0][1]); for (var i = 1; i < p.length; i++) x.lineTo(p[i][0], p[i][1]); x.closePath(); x.fill(); }\n  else if (op === 'draw') { new Function('ctx', 'canvas', a[0])(x, c); }\n};\nObject.keys(window.__state).forEach(function(k) { window.__set(k, window.__state[k]); });\n(function connectSSE() {\n  var es = new EventSource('http://127.0.0.1:%PORT%/events');\n  es.addEventListener('state', function(e) { var d = JSON.parse(e.data); if (d.src && d.src === window.__win) return; window.__set(d.name, d.value); });\n  [%EVALEV%, 'all'].forEach(function(n) { es.addEventListener(n, function(e) { try { (0, eval)(JSON.parse(e.data)); } catch(err) { console.error(err); } }); });\n  es.onerror = function() { es.close(); setTimeout(connectSSE, 1000); };\n})();"
 const SPORK_CSS_CDN = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.css"
 const SPORK_JS_CDN  = "https://cdn.jsdelivr.net/gh/unoudos/spork-ui@main/spork.js"
 
@@ -446,7 +482,9 @@ export class App {
         this._keyOn = false; this._closeOn = false; this._running = false; this._quit = false
         this._cvIds = []; this._cvLogs = {}; this._cvMouseJs = ""
         this._wins = []
+        this._winChain = Promise.resolve()   // serializa las aperturas: cada ventana calcula su id sin pisar a otra
         this._proc = null
+        this._winId = 0; this._idReady = null   // id de ventana de vspk (IPC)
         this._server = this._makeServer()    // el puerto se conoce ya, antes de construir los widgets
         this._port = this._server.port
         _currentApp = this
@@ -496,6 +534,16 @@ export class App {
     notify(title, body = "") { this.evalJs(`__vspk.notify(${js(title)},${js(body)})`) }
     copyText(text)        { this.evalJs(`__vspk.clipboard.write(${js(text)})`) }
     quit()                { this._quit = true; try { this._proc?.kill() } catch {} }
+
+    // ── Gestión de la ventana principal por IPC con vspk ─────────────────────────
+    //   app.move(100, 50) · app.resize(800, 600) · app.snap("left"|"right"|…) · app.focus()
+    //   Devuelven Promise<boolean>: false si vspk no expone el pipe o la ventana aún no está registrada.
+    async _cmd(cmd, extra) { await this._idReady; return winCmd(this._winId, cmd, extra) }
+    focus()               { return this._cmd("focus") }
+    move(x, y)            { return this._cmd("move", { x, y }) }
+    resize(w, h)          { return this._cmd("resize", { w, h }) }
+    snap(pos)             { return this._cmd("snap", { pos }) }
+    async listWindows()   { return (await ipcSend({ cmd: "list" }))?.windows ?? [] }
 
     /** fn recibe {key, code, ctrl, shift, alt, meta}. Llamar antes de run(). */
     onKey(fn) { this._keyOn = true; this._events.set(this._ev("k"), fn); return this }
@@ -621,9 +669,13 @@ export class App {
     /** Ejecuta fn cada ms milisegundos. Devuelve false desde fn para cancelarlo. */
     runEvery(ms, fn) { this._timers.push({ ms, once: false, fn }); if (this._running) this._startTimer(this._timers.at(-1)); return this }
     _startTimer(t) {
+        let busy = false
         const tick = async () => {
+            if (busy) return                      // fn async lenta: no solapar ejecuciones de runEvery
+            busy = true
             let r
             try { r = await t.fn() } catch (e) { console.error("[vspk] error en temporizador:", e); r = false }
+            busy = false
             if (t.once || r === false) t.cancel()
         }
         if (t.once) { const id = setTimeout(tick, t.ms); t.cancel = () => clearTimeout(id) }
@@ -640,6 +692,11 @@ export class App {
         const code = `__cv(${js(id)},${js(op)},${js(args)})`
         if (op === "clear") this._cvLogs[id] = ""
         this._cvLogs[id] = (this._cvLogs[id] ?? "") + code + ";"
+        // Tope: el log se reenvía entero al cargar/reconectar; descarta lo más antiguo en límite de sentencia.
+        if (this._cvLogs[id].length > 1_000_000) {
+            const cut = this._cvLogs[id].indexOf(";__cv(", 500_000)
+            if (cut !== -1) this._cvLogs[id] = this._cvLogs[id].slice(cut + 1)
+        }
         if (this._running) this._pushSse("all", code)
     }
     _cvMouse(id, fn) {
@@ -670,7 +727,13 @@ export class App {
             this._winEval(w, r === false ? "__vspk.cancelClose()" : "__vspk.confirmClose()")
         })
     }
-    async _winOpen(w) {
+    // Las aperturas van en cola: con `w1.show(); w2.show()` seguidos, w2 no toma su `before` hasta que w1 tiene id.
+    _winOpen(w) {
+        const run = this._winChain.then(() => this._winOpenNow(w))
+        this._winChain = run.catch(() => {})
+        return run
+    }
+    async _winOpenNow(w) {
         if (w.isOpen()) return
         if (w.htv) { try { await Bun.file(w.htv).delete?.() } catch {} }
         const body = w.widgets.map(x => x instanceof Widget ? x.render() : String(x)).join("\n")
@@ -678,7 +741,11 @@ export class App {
         const icon = await this._findIcon()
         const head = `title: ${w.title}\nwidth: ${w.width}\nheight: ${w.height}\ndevtools: true\n${icon ? `icon: ${icon}\n` : ""}${w.closeOn ? "on_close: confirm\n" : ""}`
         w.htv = await this._writeHtv(head + "\n" + page)
+        await this._idReady   // que la principal ya tenga su id: así la ventana nueva es la única "nueva"
+        const before = await winIds()
         w.proc = this._spawn(w.htv)
+        w.idReady = resolveWinId(before, w.htv).then(id => (w.winId = id))
+        await w.idReady
     }
 
     add(...widgets) { this._root.add(...widgets); return this }
@@ -820,7 +887,9 @@ ${code}
             + (this.devtools ? "devtools: true\n" : "") + (icon ? `icon: ${icon}\n` : "") + (this._closeOn ? "on_close: confirm\n" : "")
         const htv = await this._writeHtv(head + "\n" + html)
         try {
+            const before = await winIds()
             this._proc = this._spawn(htv)
+            this._idReady = resolveWinId(before, htv).then(id => (this._winId = id))
             this._running = true
             for (const w of this._wins) if (w.want) await this._winOpen(w)
             for (const t of this._timers) this._startTimer(t)
@@ -889,7 +958,8 @@ export class Window {
     move(x, y)         { return ipcSend({ cmd: "move",   id: this.#id, x, y }) }
     resize(w, h)       { return ipcSend({ cmd: "resize", id: this.#id, w, h }) }
     snap(pos)          { return ipcSend({ cmd: "snap",   id: this.#id, pos }) }
-    close()            { this.#process.kill() }
+    /** Cierra la ventana terminando su proceso vspk (el IPC no tiene comando 'close'; 'unregister' solo quitaría el registro). */
+    close()            { try { this.#process.kill() } catch {} }
 
     wait() { return this.#process.exited }
 
@@ -934,8 +1004,14 @@ export class Window {
                 }
             })
 
-            sock.on("error",  () => setTimeout(connect, 500))
-            sock.on("close",  () => setTimeout(connect, 500))
+            let retried = false
+            const retry = () => {
+                if (retried || !this.isOpen()) return   // error+close disparan ambos: un solo reintento
+                retried = true
+                setTimeout(connect, 500)
+            }
+            sock.on("error", retry)
+            sock.on("close", retry)
         }
 
         connect()
@@ -948,18 +1024,21 @@ export class Window {
 
 // ── open() ────────────────────────────────────────────────────────────────────
 
-export async function open(file, { title, width, height, vspkExe = "vspk" } = {}) {
+export async function open(file, { title, width, height, vspkExe = null } = {}) {
     const filePath = path.resolve(file)
+    vspkExe = vspkExe ?? (await findVspk())   // igual que App.run(): VSPK_EXE, junto al script, C:\\spork, PATH
 
     let cmd = [vspkExe, filePath]
 
+    let cfgTmp = null
     if (title || width || height) {
         const config = { file: filePath }
         if (title)  config.title  = title
         if (width)  config.width  = width
         if (height) config.height = height
-        const tmp = path.join(import.meta.dir, ".vspk_config.json")
+        const tmp = path.join(os.tmpdir(), `vspk_cfg_${Math.random().toString(36).slice(2)}.json`)
         await Bun.write(tmp, JSON.stringify(config))
+        cfgTmp = tmp
         cmd = [vspkExe, "--config", tmp]
     }
 
@@ -973,9 +1052,18 @@ export async function open(file, { title, width, height, vspkExe = "vspk" } = {}
     await waitForSocket()
 
     // Obtener ID de la ventana recien abierta
-    const list = await ipcSend({ cmd: "list" })
-    const wins = list?.windows ?? []
-    const id   = wins.length ? Math.max(...wins.map(w => w.id)) : 0
+    // El id de ventana de vspk es el PID de su proceso: esperamos (≤2 s) a que se registre; si esta versión
+    // de vspk no usa PIDs como id, se queda con el mayor id de la lista, como antes.
+    let wins = []
+    for (let t = 0; t < 40; t++) {
+        wins = (await ipcSend({ cmd: "list" }))?.windows ?? []
+        if (wins.some(w => w.id === proc.pid)) break
+        await Bun.sleep(50)
+    }
+    const id = wins.some(w => w.id === proc.pid) ? proc.pid : (wins.length ? Math.max(...wins.map(w => w.id)) : 0)
+
+    // vspk ya leyó la config al registrar la ventana: no dejar vspk_cfg_*.json acumulados en %TEMP%
+    if (cfgTmp) { try { (await import("node:fs")).unlinkSync(cfgTmp) } catch {} }
 
     return new Window(id, proc)
 }

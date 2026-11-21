@@ -8,13 +8,11 @@ Cada carpeta contiene el binding de un lenguaje y sus demos:
 | Carpeta   | Lenguaje |
 |-----------|----------|
 | `c/`      | C        |
-| `fortran/`| Fortran  |
 | `go/`     | Go       |
 | `js/`     | JavaScript |
 | `php/`    | PHP      |
 | `python/` | Python   |
 | `spork/`  | Spork    |
-| `v-lang/` | V        |
 
 Los binarios (`*.exe`, `*.jar`) no se versionan; se generan con cada toolchain.
 

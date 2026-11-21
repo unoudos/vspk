@@ -70,6 +70,7 @@
   #include <sys/types.h>
   #include <sys/time.h>
   #include <sys/socket.h>
+  #include <sys/un.h>
   #include <sys/wait.h>
   #include <netinet/in.h>
   #include <arpa/inet.h>
@@ -130,7 +131,8 @@ static void vspk__mx_init(vspk_mutex *m) {
 #ifdef _WIN32
     InitializeCriticalSection(m);
 #else
-    pthread_mutex_init(m, NULL);
+    { pthread_mutexattr_t at; pthread_mutexattr_init(&at); pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);
+      pthread_mutex_init(m, &at); pthread_mutexattr_destroy(&at); }   /* recursivo: igual que CRITICAL_SECTION en Windows */
 #endif
 }
 static void vspk__mx_lock(vspk_mutex *m) {
@@ -352,6 +354,7 @@ struct VspkCanvas { VspkApp *app; char id[64]; int w, h; VspkBuf log; };
 struct VspkWin {
     VspkApp *app; char id[16]; char title[128]; int width, height;
     VspkBuf body; VspkProc proc; char htv[600]; int want, close_on; char *close_js;
+    int before[64], nbefore, win_id, id_resolved;   /* IPC con vspk: id de ventana (0 = no disponible) */
 };
 
 struct VspkApp {
@@ -367,7 +370,8 @@ struct VspkApp {
     VspkCanvas **cvs; int ncvs; VspkBuf cvmouse;
     VspkWin **wins; int nwins;
     char **arena; int narena;
-    int key_on, close_on, running, quit, stopping, nthr, htvn;
+    char main_htv[600]; int main_before[64], main_nbefore, main_id, main_resolved;   /* IPC con vspk */
+    int key_on, close_on, running, quit, stopping, nthr, htvn, stream_on;
     VspkProc proc;
     vspk_mutex ulock, slock, alock, tlock;
 };
@@ -670,16 +674,15 @@ static void vspk_ping(VspkApp *app, const char *host, int timeout_ms, VspkResult
 static void vspk_wifi_scan(VspkApp *app, VspkResultFn fn, void *ud) { vspk_call(app, "__vspk.wifiScan()", fn, ud); }
 
 /* Streams que vspk.exe empuja a la página (proc y serial/BLE) → C */
-typedef struct { int kind, id; VspkLineFn fn; void *ud; } VspkStream;      /* kind 1 = proc, 2 = serial */
-static VspkStream *vspk__streams = NULL; static int vspk__nstreams = 0, vspk__stream_on = 0;
+typedef struct { VspkApp *app; int kind, id; VspkLineFn fn; void *ud; } VspkStream;      /* kind 1 = proc, 2 = serial */
+static VspkStream *vspk__streams = NULL; static int vspk__nstreams = 0;   /* tabla global, pero cada entrada lleva su app */
 
 static void vspk__stream_ev(const char *body, void *ud) {
     const char *pp = vspk__jfind(body, "__vspk_proc"), *sp = vspk__jfind(body, "__vspk_serial");
     int kind = pp ? 1 : 2, id = atoi(pp ? pp : (sp ? sp : "-1")), i; char *k = vspk__jstr(body, "k"), *line = vspk__jstr(body, "line");
-    (void)ud;
     for (i = 0; i < vspk__nstreams; i++) {
         VspkStream *s = &vspk__streams[i];
-        if (s->kind == kind && s->id == id) {
+        if (s->app == (VspkApp *)ud && s->kind == kind && s->id == id) {
             char code[24]; const char *l = line ? line : "";
             if (k && (strcmp(k, "exit") == 0)) { const char *c = vspk__jfind(body, "code"); snprintf(code, sizeof code, "%d", c ? atoi(c) : 0); l = code; }
             if (s->fn) s->fn(k ? k : "", l, s->ud);
@@ -691,23 +694,23 @@ static void vspk__stream_ev(const char *body, void *ud) {
 }
 static void vspk__ensure_stream(VspkApp *app) {
     char nm[64]; VspkBuf b = {0}, body = {0};
-    if (vspk__stream_on) return;
-    vspk__stream_on = 1; vspk__evname(app, nm, sizeof nm, "stream");
-    vspk__ev_add(app, nm, VSPK_EV_USER, (void *)vspk__stream_ev, NULL, NULL);
+    if (app->stream_on) return;
+    app->stream_on = 1; vspk__evname(app, nm, sizeof nm, "stream");
+    vspk__ev_add(app, nm, VSPK_EV_USER, (void *)vspk__stream_ev, app, NULL);
     vspk__postjs(app, &body, nm, "JSON.stringify(d)");
     vspk__bf(&b, "if(!window.__vspk_stream_on){window.__vspk_stream_on=1;window.addEventListener('message',function(e){var d=e.data;if(d&&(d.__vspk_proc!=null||d.__vspk_serial!=null)){%s}})}", vspk__bstr(&body));
     vspk_eval(app, vspk__bstr(&b)); free(b.p); free(body.p);
 }
-typedef struct { int kind; VspkLineFn line; void *line_ud; VspkIdFn idfn; void *id_ud; } VspkOpenCtx;
+typedef struct { VspkApp *app; int kind; VspkLineFn line; void *line_ud; VspkIdFn idfn; void *id_ud; } VspkOpenCtx;
 static void vspk__opened(int ok, const char *json, void *ud) {
     VspkOpenCtx *c = (VspkOpenCtx *)ud; int id = ok ? atoi(json) : -1;
-    if (ok) { VspkStream s; s.kind = c->kind; s.id = id; s.fn = c->line; s.ud = c->line_ud; VSPK_MASK_PUSH(vspk__streams, vspk__nstreams, VspkStream, s); }
+    if (ok) { VspkStream s; s.app = c->app; s.kind = c->kind; s.id = id; s.fn = c->line; s.ud = c->line_ud; VSPK_MASK_PUSH(vspk__streams, vspk__nstreams, VspkStream, s); }
     else fprintf(stderr, "[vspk] error: %s\n", json);
     if (c->idfn) c->idfn(id, c->id_ud);
     free(c);
 }
 static void vspk__open_stream(VspkApp *app, int kind, const char *cmd, const char *args_json, VspkLineFn line, void *line_ud, VspkIdFn idfn, void *id_ud) {
-    VspkOpenCtx *c = (VspkOpenCtx *)calloc(1, sizeof *c); c->kind = kind; c->line = line; c->line_ud = line_ud; c->idfn = idfn; c->id_ud = id_ud;
+    VspkOpenCtx *c = (VspkOpenCtx *)calloc(1, sizeof *c); c->app = app; c->kind = kind; c->line = line; c->line_ud = line_ud; c->idfn = idfn; c->id_ud = id_ud;
     vspk__ensure_stream(app); vspk_invoke(app, cmd, args_json, vspk__opened, c);
 }
 
@@ -1045,6 +1048,11 @@ static void vspk__cv(VspkCanvas *c, const char *op, const char *args_json) {
     vspk__bcat(&code, "__cv("); vspk__bjs(&code, c->id); vspk__bc(&code, ','); vspk__bjs(&code, op); vspk__bc(&code, ','); vspk__bcat(&code, args_json); vspk__bc(&code, ')');
     if (strcmp(op, "clear") == 0) { free(c->log.p); memset(&c->log, 0, sizeof c->log); }
     vspk__bcat(&c->log, vspk__bstr(&code)); vspk__bc(&c->log, ';');
+    /* Tope: el log se reenvía entero al cargar/reconectar; descarta lo más antiguo en límite de sentencia. */
+    if (c->log.len > 1000000) {
+        char *q = strstr(c->log.p + 500000, ";__cv(");
+        if (q) { size_t off = (size_t)(q + 1 - c->log.p); memmove(c->log.p, c->log.p + off, c->log.len - off); c->log.len -= off; c->log.p[c->log.len] = 0; }
+    }
     if (c->app->running) { VspkBuf j = {0}; vspk__bjs(&j, vspk__bstr(&code)); vspk__sse(c->app, "all", vspk__bstr(&j)); free(j.p); }
     free(code.p);
 }
@@ -1136,8 +1144,8 @@ static const char VSPK__PAGE_JS[] =
 "window.__win = %WIN%;\n"
 "window.__set = function(name, value) {\n"
 "  window.__state[name] = value;\n"
-"  document.querySelectorAll('[data-spork-text=\"' + name + '\"]').forEach(function(el) { el.textContent = value; });\n"
-"  document.querySelectorAll('[data-spork-bind=\"' + name + '\"]').forEach(function(el) {\n"
+"  document.querySelectorAll('[data-spork-text=\"' + CSS.escape(name) + '\"]').forEach(function(el) { el.textContent = value; });\n"
+"  document.querySelectorAll('[data-spork-bind=\"' + CSS.escape(name) + '\"]').forEach(function(el) {\n"
 "    if (el.type === 'checkbox') el.checked = !!value;\n"
 "    else if (el.value != value) el.value = value;\n"
 "  });\n"
@@ -1148,7 +1156,7 @@ static const char VSPK__PAGE_JS[] =
 "};\n"
 "// Valor que el usuario escribe/elige → a PHP (State::get() lo ve) y a los demás widgets enlazados.\n"
 "window.__sync = function(n, v) {\n"
-"  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n"
+"  try { fetch('http://127.0.0.1:%PORT%/event/%VEV%', {method: 'POST', mode: 'no-cors', keepalive: true, headers: {'Content-Type': 'text/plain'}, body: JSON.stringify({n: n, v: v, w: window.__win})}); } catch(_) {}\n"
 "};\n"
 "(function() {\n"
 "  function onUser(e) {\n"
@@ -1305,6 +1313,126 @@ static int vspk__write_htv(VspkApp *app, char *path, size_t pn, const char *head
     return 0;
 }
 static void vspk__find_icon(char *out, size_t n);
+/* ── Gestión de ventanas por IPC con vspk ─────────────────────────────────────
+ *   vspk_move(app, 100, 50);  vspk_resize(app, 800, 600);  vspk_snap(app, "left");  vspk_focus(app);
+ *   vspk_win_move(aj, x, y);  vspk_win_resize(aj, w, h);   vspk_win_snap(aj, "right");  vspk_win_focus(aj);
+ * Devuelven 1 si vspk lo aplicó y 0 si no hay pipe/socket o la ventana aún no está registrada.
+ * vspk asigna el id de ventana al abrirla: se averigua comparando `list` antes y después de lanzar.
+ * Llamar desde el hilo principal o desde callbacks (no usan cerrojos propios). */
+
+#define VSPK_IPC_BUF 16384
+
+static int vspk__ipc(const char *msg, char *resp, size_t n) {
+    size_t len = 0; resp[0] = 0;
+#ifdef _WIN32
+    {
+        HANDLE h = CreateFileA("\\\\.\\pipe\\vspk", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        DWORD w, r; char nl = '\n';
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        if (!WriteFile(h, msg, (DWORD)strlen(msg), &w, NULL) || !WriteFile(h, &nl, 1, &w, NULL)) { CloseHandle(h); return -1; }
+        while (len + 1 < n) {
+            if (!ReadFile(h, resp + len, (DWORD)(n - 1 - len), &r, NULL) || r == 0) break;
+            len += r; resp[len] = 0;
+            if (memchr(resp, '\n', len)) break;
+        }
+        CloseHandle(h);
+    }
+#else
+    {
+        struct sockaddr_un sa; struct timeval tv; int fd = socket(AF_UNIX, SOCK_STREAM, 0); char nl = '\n';
+        if (fd < 0) return -1;
+        memset(&sa, 0, sizeof sa); sa.sun_family = AF_UNIX; snprintf(sa.sun_path, sizeof sa.sun_path, "/tmp/vspk.sock");
+        tv.tv_sec = 2; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
+        if (send(fd, msg, strlen(msg), VSPK_MSG_NOSIGNAL) < 0 || send(fd, &nl, 1, VSPK_MSG_NOSIGNAL) < 0) { close(fd); return -1; }
+        while (len + 1 < n) {
+            ssize_t r = recv(fd, resp + len, n - 1 - len, 0);
+            if (r <= 0) break;
+            len += (size_t)r; resp[len] = 0;
+            if (memchr(resp, '\n', len)) break;
+        }
+        close(fd);
+    }
+#endif
+    return len ? 0 : -1;
+}
+
+/* true si needle aparece en los n primeros bytes de s */
+static int vspk__has(const char *s, size_t n, const char *needle) {
+    size_t k = strlen(needle), i;
+    if (k == 0 || n < k) return 0;
+    for (i = 0; i + k <= n; i++) if (memcmp(s + i, needle, k) == 0) return 1;
+    return 0;
+}
+
+/* Ids de ventana según `list` (sin pipe → 0). Si htv != NULL, devuelve en *match el id cuyo "file" termina en el nombre de htv. */
+static int vspk__win_list(int *ids, int max, const char *htv, int *match) {
+    char resp[VSPK_IPC_BUF]; const char *p, *base; int n = 0;
+    if (match) *match = 0;
+    if (vspk__ipc("{\"cmd\":\"list\"}", resp, sizeof resp) != 0) return 0;
+    base = htv ? htv : "";
+    { const char *a = strrchr(base, '/'), *b = strrchr(base, '\\'); if (b && (!a || b > a)) a = b; if (a) base = a + 1; }
+    for (p = strstr(resp, "\"id\":"); p && n < max; ) {
+        const char *next = strstr(p + 5, "\"id\":"); int id = atoi(p + 5);
+        if (id > 0) {
+            ids[n++] = id;
+            if (match && htv && vspk__has(p, next ? (size_t)(next - p) : strlen(p), base)) *match = id;
+        }
+        p = next;
+    }
+    return n;
+}
+
+static int vspk__in(const int *a, int n, int v) { int i; for (i = 0; i < n; i++) if (a[i] == v) return 1; return 0; }
+
+/* Espera (≤ 2 s) a que aparezca una ventana que no estaba en before[]. */
+static int vspk__resolve_win_id(const int *before, int nbefore, const char *htv) {
+    int tries;
+    for (tries = 0; tries < 40; tries++) {
+        int ids[64], match = 0, n = vspk__win_list(ids, 64, htv, &match), i, best = 0;
+        for (i = 0; i < n; i++) if (!vspk__in(before, nbefore, ids[i]) && ids[i] > best) best = ids[i];
+        if (match && !vspk__in(before, nbefore, match)) return match;   /* vspk informa del fichero: coincidencia exacta */
+        if (best) return best;                                           /* si no, la nueva con mayor id */
+        vspk__sleep_ms(50);
+    }
+    return 0;
+}
+
+static int vspk__main_win_id(VspkApp *app) {
+    if (!app->main_resolved) {
+        app->main_id = app->main_htv[0] ? vspk__resolve_win_id(app->main_before, app->main_nbefore, app->main_htv) : 0;
+        app->main_resolved = 1;
+    }
+    return app->main_id;
+}
+
+static int vspk__win_cmd(int id, const char *cmd, const char *extra) {
+    char msg[256], resp[VSPK_IPC_BUF];
+    if (id <= 0) return 0;
+    snprintf(msg, sizeof msg, "{\"cmd\":\"%s\",\"id\":%d%s%s}", cmd, id, extra && *extra ? "," : "", extra ? extra : "");
+    if (vspk__ipc(msg, resp, sizeof resp) != 0) return 0;
+    { const char *k = strstr(resp, "\"ok\""); if (!k) return 0; k += 4; while (*k == ' ' || *k == ':') k++; return strncmp(k, "true", 4) == 0; }
+}
+
+static int vspk__snap_ok(const char *pos) { const char *c; if (!pos || !*pos) return 0; for (c = pos; *c; c++) if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-')) return 0; return 1; }
+
+static int vspk__win_id_of(VspkWin *w) {
+    if (!w->id_resolved) {
+        w->win_id = (w->htv[0] && vspk__proc_alive(&w->proc)) ? vspk__resolve_win_id(w->before, w->nbefore, w->htv) : 0;
+        w->id_resolved = 1;
+    }
+    return w->win_id;
+}
+
+static int vspk_focus(VspkApp *app)                  { return vspk__win_cmd(vspk__main_win_id(app), "focus", NULL); }
+static int vspk_move(VspkApp *app, int x, int y)     { char e[64]; snprintf(e, sizeof e, "\"x\":%d,\"y\":%d", x, y); return vspk__win_cmd(vspk__main_win_id(app), "move", e); }
+static int vspk_resize(VspkApp *app, int w, int h)   { char e[64]; snprintf(e, sizeof e, "\"w\":%d,\"h\":%d", w, h); return vspk__win_cmd(vspk__main_win_id(app), "resize", e); }
+static int vspk_snap(VspkApp *app, const char *pos)  { char e[96]; if (!vspk__snap_ok(pos)) return 0; snprintf(e, sizeof e, "\"pos\":\"%s\"", pos); return vspk__win_cmd(vspk__main_win_id(app), "snap", e); }
+static int vspk_win_focus(VspkWin *w)                { return vspk__win_cmd(vspk__win_id_of(w), "focus", NULL); }
+static int vspk_win_move(VspkWin *w, int x, int y)   { char e[64]; snprintf(e, sizeof e, "\"x\":%d,\"y\":%d", x, y); return vspk__win_cmd(vspk__win_id_of(w), "move", e); }
+static int vspk_win_resize(VspkWin *w, int wd, int h){ char e[64]; snprintf(e, sizeof e, "\"w\":%d,\"h\":%d", wd, h); return vspk__win_cmd(vspk__win_id_of(w), "resize", e); }
+static int vspk_win_snap(VspkWin *w, const char *pos){ char e[96]; if (!vspk__snap_ok(pos)) return 0; snprintf(e, sizeof e, "\"pos\":\"%s\"", pos); return vspk__win_cmd(vspk__win_id_of(w), "snap", e); }
+
 static void vspk__win_open(VspkWin *w) {
     VspkApp *app = w->app; char exe[520], icon[300]; char *page; VspkBuf head = {0};
     if (vspk__proc_alive(&w->proc)) return;
@@ -1314,6 +1442,8 @@ static void vspk__win_open(VspkWin *w) {
     vspk__find_icon(icon, sizeof icon); if (icon[0]) vspk__bf(&head, "icon: %s\n", icon);
     if (vspk__write_htv(app, w->htv, sizeof w->htv, vspk__bstr(&head), page) == 0) {
         vspk__find_exe(app, exe, sizeof exe);
+        vspk__main_win_id(app);   /* que la principal ya tenga su id: así la ventana nueva es la única "nueva" */
+        w->nbefore = vspk__win_list(w->before, 64, NULL, NULL); w->win_id = 0; w->id_resolved = 0;
         vspk__proc_spawn(&w->proc, exe, w->htv);
     }
     free(page); free(head.p);
@@ -1436,6 +1566,11 @@ VSPK_THREAD_FN(vspk__client_thread) {
         VspkClient *c = (VspkClient *)calloc(1, sizeof *c); long long lastping = vspk__now_ms();
         static const char hdr[] = "HTTP/1.1 200 OK\r\n" VSPK_CORS "Content-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n: conectado\n\n";
         c->s = s; c->alive = 1;
+#ifdef _WIN32
+        { DWORD tv = 2000; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof tv); }   /* un cliente atascado no bloquea slock */
+#else
+        { struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+#endif
         if (vspk__send_all(s, hdr, sizeof hdr - 1) != 0) { free(c); goto done; }
         vspk__mx_lock(&app->slock); VSPK_MASK_PUSH(app->clients, app->nclients, VspkClient *, c); vspk__mx_unlock(&app->slock);
         while (c->alive && !app->stopping) {
@@ -1457,7 +1592,7 @@ VSPK_THREAD_FN(vspk__client_thread) {
     }
     if (strncmp(path, "/event/", 7) == 0 && strcmp(method, "POST") == 0) {
         vspk__reply(s, "200 OK", "ok"); vspk__sock_close(s); s = VSPK_BADSOCK;
-        vspk__dispatch_ev(app, path + 7, hend + 4); goto done;
+        vspk__dispatch_ev(app, path + 7, hend ? hend + 4 : ""); goto done;
     }
     vspk__reply(s, "404 Not Found", "not found");
 done:
@@ -1528,8 +1663,18 @@ static void vspk_free(VspkApp *app) {
 
 static void vspk__find_icon(char *out, size_t n) {
     static const char *names[] = { "icon.ico", "icon.png", "favicon.ico", "favicon.png", NULL }; int i;
+    char dir[520] = "", cand[600];
     out[0] = 0;
     for (i = 0; names[i]; i++) if (vspk__file_exists(names[i])) { snprintf(out, n, "%s", names[i]); return; }
+    /* si no está en el directorio actual, junto al ejecutable (el binario puede lanzarse desde otra carpeta) */
+#ifdef _WIN32
+    { DWORD k = GetModuleFileNameA(NULL, dir, (DWORD)sizeof dir); if (k == 0 || k >= sizeof dir) dir[0] = 0; }
+#else
+    { ssize_t k = readlink("/proc/self/exe", dir, sizeof dir - 1); if (k > 0) dir[k] = 0; else dir[0] = 0; }
+#endif
+    { char *sl = strrchr(dir, '/'), *bs = strrchr(dir, '\\'); if (bs > sl) sl = bs; if (sl) *sl = 0; else dir[0] = 0; }
+    if (!dir[0]) return;
+    for (i = 0; names[i]; i++) { snprintf(cand, sizeof cand, "%s/%s", dir, names[i]); if (vspk__file_exists(cand)) { snprintf(out, n, "%s", cand); return; } }
 }
 
 /* Abre vspk con un .htv temporal y atiende eventos hasta que se cierra la ventana. Devuelve 0 (1 si no pudo lanzar vspk). */
@@ -1544,6 +1689,8 @@ static int vspk_run(VspkApp *app) {
     if (vspk__write_htv(app, htv, sizeof htv, vspk__bstr(&head), html) != 0) { fprintf(stderr, "[vspk] no se pudo escribir el .htv\n"); free(html); free(head.p); return 1; }
     free(html); free(head.p);
 
+    snprintf(app->main_htv, sizeof app->main_htv, "%s", htv); app->main_id = 0; app->main_resolved = 0;
+    app->main_nbefore = vspk__win_list(app->main_before, 64, NULL, NULL);
     if (vspk__proc_spawn(&app->proc, exe, htv) != 0) { fprintf(stderr, "[vspk] no se pudo lanzar %s\n", exe); remove(htv); return 1; }
     app->running = 1;
     vspk__mx_lock(&app->ulock);
