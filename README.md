@@ -1,7 +1,7 @@
 # vspk
 
 Ventana nativa ligera (tao/wry) para apps web/HTML, con bindings para varios lenguajes.
-Un mismo `vspk` se usa desde C, Fortran, Go, JavaScript, PHP, Python, Spork y V.
+Un mismo `vspk` se usa desde C,  Go, JavaScript, PHP, Python y Spork.
 
 Cada carpeta contiene el binding de un lenguaje y sus demos:
 
